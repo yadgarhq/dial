@@ -22,7 +22,7 @@ repos:
   # at first install and never re-resolves it, so a moving tag would silently
   # freeze each machine at whatever it meant the day it first ran.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.4.1
+    rev: v1.5.0
     hooks:
       - id: gitleaks
       - id: prettier
