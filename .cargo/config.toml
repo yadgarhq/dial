@@ -1,0 +1,9 @@
+[net]
+# cargo's built-in git transport tries ssh-agent and gives up; the git CLI
+# already holds whatever URL rewriting and credentials the environment provides,
+# and works unchanged on a clean CI runner where no rewriting exists.
+#
+# Needed because yadgar-store is a git dependency pinned by revision rather than
+# a registry crate. The alternative — publishing store to crates.io — would make
+# an internal library public on a schedule nobody wants to own.
+git-fetch-with-cli = true

@@ -1,0 +1,29 @@
+[package]
+name = "yadgar-dial"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "How a service reaches another service: client-side gRPC balancing over a headless Service (D23)."
+
+[dependencies]
+# Only what dialling needs. No proto, no telemetry, no store — a crate every
+# service links should pull in as little as possible, because its dependency tree
+# becomes theirs.
+tonic = { version = "0.14", default-features = false, features = [
+  "codegen",
+  "transport",
+  "channel",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

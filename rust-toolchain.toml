@@ -1,0 +1,17 @@
+[toolchain]
+# Aligned with the rust-build base image (rust:1.98-bookworm, D63). A repo that
+# pins an OLDER channel makes rustup fetch a second toolchain inside the image
+# and recompile everything with it — which throws away the cargo-chef dependency
+# layer the base exists to provide, silently and slowly.
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+
+# DECLARED, not assumed. The base runs `rustup target add
+# x86_64-unknown-linux-musl` against ITS default toolchain; a rust-toolchain.toml
+# switches to a different one, and that one has no musl std. The build then fails
+# with `can't find crate for core` — which reads as a broken toolchain rather
+# than a missing target.
+#
+# musl is what makes the runtime distroless/static rather than distroless/cc, a
+# base ten times larger carrying a libc nothing here calls (D63).
+targets = ["x86_64-unknown-linux-musl"]
