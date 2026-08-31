@@ -1,0 +1,36 @@
+name: ci
+
+# CI is defined once in yadgarhq/actions (D62). This file is the whole of this
+# repository's CI configuration: the shared workflow detects what the repository
+# is and runs what applies.
+#
+# NO WORKFLOW-LEVEL `permissions:` BLOCK, deliberately. A job cannot ask for more
+# than the workflow grants, so a top-level `contents: read` makes the release
+# job's `packages: write` invalid — and the failure is a run with ZERO JOBS and
+# no logs, which says nothing about permissions. Each job states its own instead.
+#
+# Push to main runs the version report only. Validating there would re-run what
+# the pull request just passed, on code already merged, with nobody watching —
+# and the ruleset makes direct pushes impossible, so there is no drift to catch.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  ci:
+    if: "!startsWith(github.ref, 'refs/tags/')"
+    uses: yadgarhq/actions/.github/workflows/ci-pr.yml@main
+    permissions:
+      contents: read
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: yadgarhq/actions/.github/workflows/ci-release.yml@main
+    with:
+      version: ${{ github.ref_name }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
