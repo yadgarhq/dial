@@ -95,11 +95,7 @@ pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
             host: host.to_string(),
         });
     }
-    tracing::info!(
-        host,
-        count = initial.len(),
-        "balancing across task-db replicas"
-    );
+    tracing::info!(host, count = initial.len(), "balancing across replicas");
 
     let (channel, tx) = Channel::balance_channel::<SocketAddr>(initial.len().max(8));
     for addr in &initial {
@@ -151,11 +147,11 @@ async fn refresh(
         for change in diff(&current, &resolved) {
             let sent = match change {
                 Change::Insert(addr, ()) => {
-                    tracing::info!(%addr, "task-db endpoint added");
+                    tracing::info!(host, %addr, "endpoint added");
                     tx.send(Change::Insert(addr, endpoint(addr))).await
                 }
                 Change::Remove(addr) => {
-                    tracing::info!(%addr, "task-db endpoint removed");
+                    tracing::info!(host, %addr, "endpoint removed");
                     tx.send(Change::Remove(addr)).await
                 }
             };
