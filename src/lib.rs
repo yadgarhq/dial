@@ -58,6 +58,24 @@
 //! an undecodable one, and one that contains no certificate all fail at
 //! [`connect_tls`]. Nothing here falls back to cleartext, and nothing here falls
 //! back to the platform trust store.
+//!
+//! # Timeouts
+//!
+//! Three bounds, on three different things, and the distinction is the whole
+//! reason the third one exists.
+//!
+//! | bound | what it catches |
+//! | --- | --- |
+//! | `connect_timeout` | a TCP connect that does not complete |
+//! | HTTP/2 keepalive | a peer that VANISHED without closing its connection |
+//! | [`default_request_timeout`] | a peer that is alive, connected, answering pings, and never replies |
+//!
+//! **The third was missing, and nothing else covers it.** A `-db` blocked on its
+//! engine connects fine, pings fine, and holds every caller's handler open
+//! indefinitely — which is also why a `tcpSocket` readiness probe stays green
+//! straight through it. [`connect`] and [`connect_tls`] apply a default;
+//! [`connect_with_request_timeout`] and [`connect_tls_with_request_timeout`]
+//! take the caller's own.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -85,6 +103,31 @@ const RERESOLVE: Duration = Duration::from_secs(5);
 /// rather than written twice because it bounds TWO phases once TLS is on — see
 /// `endpoint`, where the reason it has to be stated twice is recorded.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long ONE request may take once a connection has been chosen for it.
+///
+/// **Nothing else here bounds this.** `CONNECT_TIMEOUT` bounds the TCP connect,
+/// and HTTP/2 keepalive notices a peer that vanished. A peer that is alive,
+/// connected, answering pings and simply never replying is bounded by neither,
+/// and that is precisely the shape of a `-db` blocked on its engine: without
+/// this, one wedged callee holds every caller's handler open for as long as it
+/// stays wedged.
+///
+/// **THIRTY SECONDS, chosen against the deadlines already in this system rather
+/// than picked.** It has to sit ABOVE every deadline a caller set deliberately,
+/// or it pre-empts a number somebody sized for a real call — `gateway`'s
+/// `AUTH_DEADLINE` is 10s, sized for the Argon2id `iam` pays on every login
+/// attempt, and its `RESOLVE_DEADLINE` is 5s, on the hot path of every call. It
+/// has to sit BELOW the point at which the answer arrives to nobody: 60s is the
+/// conventional idle timeout of an ingress and of most HTTP clients. Thirty is
+/// three times the longest deliberate deadline in the tree and half the point
+/// where the caller has already gone. A caller that needs another number passes
+/// one rather than editing this.
+///
+/// It is a CEILING on the pathological case, not a latency target. A healthy
+/// call through `dial` is a single query away from its answer and finishes
+/// three orders of magnitude inside this.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What changed between two resolutions.
 ///
@@ -194,7 +237,11 @@ impl TlsOptions {
     }
 }
 
-fn endpoint(addr: SocketAddr, tls: Option<&ClientTlsConfig>) -> Result<Endpoint, BalanceError> {
+fn endpoint(
+    addr: SocketAddr,
+    tls: Option<&ClientTlsConfig>,
+    request_timeout: Duration,
+) -> Result<Endpoint, BalanceError> {
     // THE SCHEME IS WHAT SWITCHES TLS ON, not the presence of a configuration.
     // tonic's connector tests `uri.scheme_str() == Some("https")` and, for an
     // `http://` URI, connects in cleartext while holding a perfectly good TLS
@@ -215,7 +262,17 @@ fn endpoint(addr: SocketAddr, tls: Option<&ClientTlsConfig>) -> Result<Endpoint,
         // HTTP/2 keepalive notices a pod that vanished without closing its
         // connection — the common case when a node goes away.
         .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_timeout(Duration::from_secs(3));
+        .keep_alive_timeout(Duration::from_secs(3))
+        // THE BOUND ON A PEER THAT IS SIMPLY SILENT, which neither of the two
+        // above covers. See `REQUEST_TIMEOUT` for the reason a healthy-looking
+        // connection needs one at all.
+        //
+        // ONE bound, BOTH paths: this call site is reached identically whether
+        // or not `tls` is set, so there is nothing for the cleartext and TLS
+        // paths to drift apart about. The handshake bound in
+        // `TlsOptions::prepare` stays the one timeout the TLS path carries
+        // alone, and it bounds a different thing — see the note above.
+        .timeout(request_timeout);
 
     match tls {
         None => Ok(endpoint),
@@ -236,8 +293,38 @@ fn endpoint(addr: SocketAddr, tls: Option<&ClientTlsConfig>) -> Result<Endpoint,
 /// The task holds a `Sender` into the channel's discovery stream and lives as
 /// long as the channel does; when the channel is dropped the send fails and the
 /// loop exits, so there is no task leak.
+///
+/// Requests are bounded by [`default_request_timeout`]. A caller that needs its
+/// own bound uses [`connect_with_request_timeout`].
 pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
-    connect_with(host, port, None).await
+    connect_with(host, port, None, REQUEST_TIMEOUT).await
+}
+
+/// [`connect`], with the caller's own per-request bound instead of the default.
+///
+/// **It is a BACKSTOP, not the caller's deadline, and the two are not the same
+/// thing.** A caller that sets a gRPC deadline — `tonic::Request::set_timeout`,
+/// which travels as the `grpc-timeout` header — still gets that deadline when
+/// it is SHORTER: tonic applies whichever of the two is smaller. What this adds
+/// is the other side of that comparison, so a caller with a long deadline, or
+/// with none at all, cannot leave a request open indefinitely on a peer that
+/// has stopped answering. A caller that bounds the call some other way, such as
+/// wrapping it in `tokio::time::timeout` — which is what `gateway` does today —
+/// is not talking to this mechanism at all: the two run independently, and
+/// whichever expires first ends that caller's wait.
+///
+/// **What it does not cover, said rather than left to be discovered.** The
+/// bound is on the wait for the response to BEGIN — the future it wraps yields
+/// the response head — so a peer that sends headers and then stalls its body is
+/// not caught by it. Nor is a request that has not been handed to a connection
+/// yet because no endpoint is ready; that is the balancer's readiness, one
+/// layer up.
+pub async fn connect_with_request_timeout(
+    host: &str,
+    port: u16,
+    request_timeout: Duration,
+) -> Result<Channel, BalanceError> {
+    connect_with(host, port, None, request_timeout).await
 }
 
 /// [`connect`], with the transport encrypted and the peer verified.
@@ -256,17 +343,33 @@ pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
 /// CLIENT certificate — mutual TLS — is a later addition to [`TlsOptions`] and
 /// changes nothing about this signature.
 pub async fn connect_tls(host: &str, port: u16, tls: &TlsOptions) -> Result<Channel, BalanceError> {
+    connect_tls_with_request_timeout(host, port, tls, REQUEST_TIMEOUT).await
+}
+
+/// [`connect_tls`], with the caller's own per-request bound instead of the
+/// default.
+///
+/// The bound is the same one [`connect_with_request_timeout`] applies, set at
+/// the same place, and everything said there about a caller's own deadline
+/// holds here unchanged. Encryption does not move it.
+pub async fn connect_tls_with_request_timeout(
+    host: &str,
+    port: u16,
+    tls: &TlsOptions,
+    request_timeout: Duration,
+) -> Result<Channel, BalanceError> {
     // BEFORE the DNS lookup, deliberately. A misconfigured bundle is the
     // operator's mistake and should be reported as itself, not shadowed by
     // whatever the resolver says about a host they were never going to reach.
     let prepared = tls.prepare(host)?;
-    connect_with(host, port, Some(prepared)).await
+    connect_with(host, port, Some(prepared), request_timeout).await
 }
 
 async fn connect_with(
     host: &str,
     port: u16,
     tls: Option<ClientTlsConfig>,
+    request_timeout: Duration,
 ) -> Result<Channel, BalanceError> {
     let initial = resolve(host, port).await?;
     if initial.is_empty() {
@@ -293,7 +396,7 @@ async fn connect_with(
     // by the accident that nothing in `endpoint` depends on the address.
     let built = initial
         .iter()
-        .map(|addr| Ok((*addr, endpoint(*addr, tls.as_ref())?)))
+        .map(|addr| Ok((*addr, endpoint(*addr, tls.as_ref(), request_timeout)?)))
         .collect::<Result<Vec<_>, BalanceError>>()?;
 
     let (channel, tx) = Channel::balance_channel::<SocketAddr>(built.len().max(8));
@@ -303,7 +406,14 @@ async fn connect_with(
         let _ = tx.send(Change::Insert(addr, built)).await;
     }
 
-    tokio::spawn(refresh(host.to_string(), port, initial, tx, tls));
+    tokio::spawn(refresh(
+        host.to_string(),
+        port,
+        initial,
+        tx,
+        tls,
+        request_timeout,
+    ));
     Ok(channel)
 }
 
@@ -316,6 +426,7 @@ async fn refresh(
     mut current: BTreeSet<SocketAddr>,
     tx: Sender<Change<SocketAddr, Endpoint>>,
     tls: Option<ClientTlsConfig>,
+    request_timeout: Duration,
 ) {
     loop {
         tokio::time::sleep(RERESOLVE).await;
@@ -354,7 +465,7 @@ async fn refresh(
                     // the endpoint in cleartext — is the exact downgrade this
                     // module exists to prevent, and it must not be reachable
                     // even by accident.
-                    let built = match endpoint(addr, tls.as_ref()) {
+                    let built = match endpoint(addr, tls.as_ref(), request_timeout) {
                         Ok(built) => built,
                         Err(e) => {
                             tracing::error!(
@@ -398,6 +509,14 @@ async fn resolve(host: &str, port: u16) -> Result<BTreeSet<SocketAddr>, BalanceE
 /// it, and so "did anyone actually re-resolve?" is answerable from outside.
 pub const fn reresolve_interval() -> Duration {
     RERESOLVE
+}
+
+/// The per-request bound [`connect`] and [`connect_tls`] apply.
+///
+/// Exposed so a caller can log the number it is actually running with, and so a
+/// caller that chooses its own can say what it departed from.
+pub const fn default_request_timeout() -> Duration {
+    REQUEST_TIMEOUT
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -464,11 +583,15 @@ mod tests {
     fn the_scheme_follows_the_tls_configuration() {
         let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
 
-        let cleartext = endpoint(addr, None).unwrap();
+        let cleartext = endpoint(addr, None, REQUEST_TIMEOUT).unwrap();
         assert_eq!(cleartext.uri().scheme_str(), Some("http"));
 
-        let secured = endpoint(addr, Some(&ClientTlsConfig::new().domain_name("task-db")))
-            .expect("a TLS endpoint with a valid domain builds");
+        let secured = endpoint(
+            addr,
+            Some(&ClientTlsConfig::new().domain_name("task-db")),
+            REQUEST_TIMEOUT,
+        )
+        .expect("a TLS endpoint with a valid domain builds");
         assert_eq!(secured.uri().scheme_str(), Some("https"));
     }
 
@@ -480,7 +603,7 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
         let tls = ClientTlsConfig::new().domain_name("not a server name");
         assert!(matches!(
-            endpoint(addr, Some(&tls)),
+            endpoint(addr, Some(&tls), REQUEST_TIMEOUT),
             Err(BalanceError::Tls { .. })
         ));
     }

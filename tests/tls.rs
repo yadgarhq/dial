@@ -13,7 +13,8 @@
 //!
 //! CERTIFICATES ARE MINTED PER RUN. A fixture key committed to the repository is
 //! a secret committed to the repository, and it expires on a date nobody is
-//! watching.
+//! watching. The minting, and the CA bundle on disk, live in `tests/common` so
+//! this suite and `tests/timeout.rs` cannot come to disagree about them.
 //!
 //! NOTE ON `localhost`: it is the one name that resolves without touching
 //! `/etc/hosts`, and on this machine it resolves to BOTH `::1` and `127.0.0.1`.
@@ -22,86 +23,21 @@
 //! property of the test rig, not of the crate.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
-};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::{http, Service};
 use tonic::transport::{Channel, Identity, Server, ServerTlsConfig};
 use yadgar_dial::TlsOptions;
 
+mod common;
+
+use common::{pki, ready, Pki, TempPem};
+
 /// The name the test certificates are issued for, and the name the test rig
 /// listens on.
 const SERVED_NAME: &str = "localhost";
-
-/// A certificate authority and one certificate it issued.
-struct Pki {
-    ca_pem: String,
-    cert_pem: String,
-    key_pem: String,
-}
-
-/// Mint a CA and a server certificate whose ONLY subject alternative name is
-/// `san` — a DNS name, with no IP SAN. The absence is what makes the
-/// host-versus-address distinction observable at all: an implementation that
-/// verifies against `127.0.0.1` has nothing to match.
-fn pki(san: &str) -> Pki {
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "yadgar-dial test authority");
-    let ca = CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
-
-    let key = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec![san.to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    params.distinguished_name.push(DnType::CommonName, san);
-    let cert = params.signed_by(&key, &ca).unwrap();
-
-    Pki {
-        ca_pem: ca.pem(),
-        cert_pem: cert.pem(),
-        key_pem: key.serialize_pem(),
-    }
-}
-
-/// A file that deletes itself, so a CA bundle can be handed over as a PATH —
-/// which is the only shape [`TlsOptions`] accepts, and the reason it accepts it.
-struct TempPem(PathBuf);
-
-impl TempPem {
-    fn with(contents: &str) -> Self {
-        let name = format!(
-            "yadgar-dial-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(name);
-        std::fs::write(&path, contents).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempPem {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 /// Serve gRPC over TLS on every address `SERVED_NAME` resolves to, and return
 /// the shared port. `Routes::default()` answers every method with
@@ -125,7 +61,7 @@ async fn serve(p: &Pki) -> u16 {
         spawn_tls_server(listener, p);
     }
 
-    ready(port).await;
+    ready(SERVED_NAME, port).await;
     port
 }
 
@@ -144,7 +80,7 @@ async fn serve_cleartext() -> u16 {
             .unwrap();
         spawn_cleartext_server(listener);
     }
-    ready(port).await;
+    ready(SERVED_NAME, port).await;
     port
 }
 
@@ -169,21 +105,6 @@ fn spawn_cleartext_server(listener: TcpListener) {
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await;
     });
-}
-
-/// Wait until the port accepts a TCP connection, rather than sleeping a
-/// guessed interval.
-async fn ready(port: u16) {
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect((SERVED_NAME, port))
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the test server never accepted a connection on port {port}");
 }
 
 /// Send one gRPC request down the channel and report whether it ARRIVED.
