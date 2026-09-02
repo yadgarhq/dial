@@ -74,6 +74,59 @@ Server TLS with client-side verification is what exists today. Presenting a
 **client** certificate — mutual TLS — is two more paths on `TlsOptions` and does
 not change `connect_tls`.
 
+## Timeouts
+
+Three bounds, on three different things:
+
+| bound                 | what it catches                                                     |
+| --------------------- | ------------------------------------------------------------------- |
+| connect timeout (2s)  | a TCP connect that does not complete                                |
+| HTTP/2 keepalive      | a peer that **vanished** without closing its connection             |
+| request timeout (30s) | a peer that is alive, connected, answering pings, and never replies |
+
+**The third one is the one that gets left out.** The first two look like they
+cover everything, and they do not: a `-db` blocked on its engine completes its
+connect, answers every keepalive ping, and holds each caller's handler open for
+as long as it stays blocked. That is also why a `tcpSocket` readiness probe
+stays green straight through such an outage — the same defect seen from the
+other end.
+
+`connect` and `connect_tls` apply the default. A caller that needs its own
+passes one:
+
+```rust
+let channel =
+    yadgar_dial::connect_with_request_timeout("task-db", 50051, Duration::from_secs(5)).await?;
+```
+
+**It is a backstop, not the caller's deadline.** A caller that sets a gRPC
+deadline (`Request::set_timeout`) still gets that deadline when it is shorter —
+tonic applies whichever of the two is smaller. What this adds is the other side
+of that comparison, so a caller with a long deadline, or with none at all,
+cannot leave a request open indefinitely on a peer that stopped answering. A
+caller that bounds the call some other way, such as `tokio::time::timeout`, is
+not talking to this mechanism at all: the two run independently, and whichever
+expires first ends that caller's wait.
+
+**The default is 30s, chosen against the deadlines already in this system.** It
+sits above every deadline a caller set on purpose — the longest is `gateway`'s
+10s for a login, sized for the Argon2id `iam` pays on every attempt — so it
+never pre-empts a number somebody chose for a real call. It sits below 60s, the
+conventional idle timeout of an ingress and of most HTTP clients, so it fires
+while somebody is still waiting for the answer.
+
+**Both paths carry the same bound**, set at one call site from one argument, so
+`connect` and `connect_tls` have nothing to drift apart about. The one timeout
+the TLS path carries alone is the handshake bound in `TlsOptions`, and it bounds
+a different thing: tonic's connect timeout covers the TCP connect only, while
+the handshake runs in the layer above it.
+
+What the bound does **not** cover, so it is not mistaken for more than it is: a
+peer that sends response headers and then stalls its body, because the bound is
+on the wait for the response to begin; and a request that has not been handed to
+a connection yet because no endpoint is ready, which is the balancer's readiness
+one layer up.
+
 ## Dependencies
 
 Deliberately minimal: `tonic`, `tokio`, `tracing`, and `rustls-pki-types` to
