@@ -30,23 +30,61 @@
 //! every endpoint on that basis is a self-inflicted outage from a transient DNS
 //! answer. `diff` itself has no such opinion — it is pure — so the guard lives in
 //! the loop and the test for the recovering-from-zero case lives here.
+//!
+//! # TLS
+//!
+//! [`connect`] dials in CLEARTEXT and always has. On a single-node cluster that
+//! is invisible; on a shared cluster with a flat pod network it is a bearer
+//! token anyone on that network can read. [`connect_tls`] is the same dialling
+//! with the transport encrypted and the peer verified, and it is OPT-IN: this
+//! code ships first, and turning it on for a given caller is a separate change
+//! that can be reverted on its own.
+//!
+//! **The part that is easy to get wrong is which name the certificate is checked
+//! against.** This crate resolves a host to a set of ADDRESSES and dials those,
+//! so the obvious implementation verifies the server's certificate against an IP
+//! — which needs an IP SAN no issuer grants per pod, and whose usual "fix" is to
+//! stop verifying. [`TlsOptions`] pins the verification domain to the HOST the
+//! caller asked for, independently of the address dialled. That is what lets a
+//! certificate issued for the Service name work while the balancer goes on
+//! talking to pod IPs.
+//!
+//! **Configuration is file paths, never an issuer-specific resource** (D80). A
+//! CA bundle on disk is written by cert-manager in the reference deployment and
+//! by a hand-assembled Secret anywhere else, and this crate cannot tell the
+//! difference — which is the point.
+//!
+//! **A misconfiguration is an error, never a downgrade.** An unreadable bundle,
+//! an undecodable one, and one that contains no certificate all fail at
+//! [`connect_tls`]. Nothing here falls back to cleartext, and nothing here falls
+//! back to the platform trust store.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use tokio::sync::mpsc::Sender;
 // tonic re-exports its OWN Change. Importing tower::discover::Change directly
 // compiles and then fails to match: the two are distinct types even at the same
 // tower version, and the error reads "expected Change, found a different Change".
 use tonic::transport::channel::Change;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 /// How often the endpoint set is re-resolved.
 ///
 /// Kubernetes headless DNS has a short TTL, and pods come and go on deploys and
 /// autoscaling events. Five seconds is well inside a rolling update's window.
 const RERESOLVE: Duration = Duration::from_secs(5);
+
+/// How long one phase of establishing a connection may take.
+///
+/// A dead pod must not hold a request open until the caller's deadline. Named
+/// rather than written twice because it bounds TWO phases once TLS is on — see
+/// `endpoint`, where the reason it has to be stated twice is recorded.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What changed between two resolutions.
 ///
@@ -66,15 +104,125 @@ pub fn diff(
     removed.chain(added).collect()
 }
 
-fn endpoint(addr: SocketAddr) -> Endpoint {
-    Endpoint::from_shared(format!("http://{addr}"))
+/// Per-service TLS: a CA bundle on disk, and the name to verify against.
+///
+/// **Paths and a name, deliberately — never an issuer-specific resource** (D80).
+/// The reference deployment has cert-manager write these files; an operator on
+/// EKS assembling a Secret by hand produces something this crate cannot tell
+/// apart, and neither can be named here without making one platform a
+/// requirement.
+///
+/// **The verification domain defaults to the host being dialled, and that is the
+/// whole point.** `dial` balances across pod ADDRESSES, so a certificate is
+/// verified against the Service name the caller asked for rather than against
+/// whichever IP the balancer happens to have picked. [`TlsOptions::domain_name`]
+/// overrides it for the case where the certificate names something else — a
+/// per-namespace FQDN, say — and is not needed otherwise.
+///
+/// **Mutual TLS is a configuration addition from here, not a redesign.** The
+/// caller passes this struct rather than a list of arguments, so presenting a
+/// client certificate becomes a builder method taking two more paths, and
+/// [`connect_tls`]'s signature does not change again.
+#[derive(Clone, Debug)]
+pub struct TlsOptions {
+    ca_certificate: PathBuf,
+    domain_name: Option<String>,
+}
+
+impl TlsOptions {
+    /// Verify the peer against the certificate authorities in the PEM bundle at
+    /// `ca_certificate`.
+    ///
+    /// The file is read and checked when [`connect_tls`] runs, not here.
+    pub fn new(ca_certificate: impl Into<PathBuf>) -> Self {
+        Self {
+            ca_certificate: ca_certificate.into(),
+            domain_name: None,
+        }
+    }
+
+    /// Verify the peer's certificate against `domain_name` instead of against
+    /// the host passed to [`connect_tls`].
+    pub fn domain_name(self, domain_name: impl Into<String>) -> Self {
+        Self {
+            domain_name: Some(domain_name.into()),
+            ..self
+        }
+    }
+
+    /// Read and CHECK the CA bundle, and settle the verification domain.
+    ///
+    /// Everything that can be wrong about the configuration is wrong here, once,
+    /// before a channel exists — so a bad path is a startup error rather than an
+    /// unexplained handshake failure much later, and never a quiet downgrade.
+    fn prepare(&self, host: &str) -> Result<ClientTlsConfig, BalanceError> {
+        let pem =
+            std::fs::read(&self.ca_certificate).map_err(|source| BalanceError::CaUnreadable {
+                path: self.ca_certificate.clone(),
+                source,
+            })?;
+
+        // THE ASSERTION THIS FUNCTION EXISTS FOR. The PEM reader yields nothing
+        // — rather than an error — for input that contains no certificate
+        // section, so "parsed successfully" can mean "parsed nothing", and a
+        // trust store with no roots trusts nobody. Left unchecked that surfaces
+        // as a handshake failure against a hostname the operator has never seen,
+        // which is among the hardest errors here to diagnose.
+        let certificates = CertificateDer::pem_slice_iter(&pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| BalanceError::CaUnparsable {
+                path: self.ca_certificate.clone(),
+                source,
+            })?;
+        if certificates.is_empty() {
+            return Err(BalanceError::CaEmpty {
+                path: self.ca_certificate.clone(),
+            });
+        }
+
+        Ok(ClientTlsConfig::new()
+            // The host, NOT the address that gets dialled.
+            .domain_name(self.domain_name.as_deref().unwrap_or(host))
+            .ca_certificate(Certificate::from_pem(&pem))
+            // See `endpoint` for why the handshake needs its own bound.
+            .timeout(CONNECT_TIMEOUT))
+        // NOTE the two methods NOT called here: `with_native_roots` and
+        // `with_webpki_roots`. Either would add the platform's trust store
+        // alongside the bundle, so a CA that failed to load would leave the
+        // peer verified against public roots instead — the silent downgrade
+        // this change exists to remove, reintroduced one layer up.
+    }
+}
+
+fn endpoint(addr: SocketAddr, tls: Option<&ClientTlsConfig>) -> Result<Endpoint, BalanceError> {
+    // THE SCHEME IS WHAT SWITCHES TLS ON, not the presence of a configuration.
+    // tonic's connector tests `uri.scheme_str() == Some("https")` and, for an
+    // `http://` URI, connects in cleartext while holding a perfectly good TLS
+    // configuration it never consults. So the two are decided together, here,
+    // and cannot drift apart.
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let endpoint = Endpoint::from_shared(format!("{scheme}://{addr}"))
         .expect("a socket address always forms a valid authority")
         // A dead pod must not hold a request open until the caller's deadline.
-        .connect_timeout(Duration::from_secs(2))
+        // tonic applies this to the TCP connect alone: it is set on the inner
+        // HTTP connector, while the TLS handshake runs in the layer above it. A
+        // peer that accepts the connection and then stalls the handshake would
+        // otherwise be unbounded, so `TlsOptions::prepare` gives the handshake
+        // the SAME bound explicitly. A stalled peer therefore costs at most two
+        // of these, not one — which is the one place the TLS path differs from
+        // the cleartext path, stated rather than left to be discovered.
+        .connect_timeout(CONNECT_TIMEOUT)
         // HTTP/2 keepalive notices a pod that vanished without closing its
         // connection — the common case when a node goes away.
         .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_timeout(Duration::from_secs(3))
+        .keep_alive_timeout(Duration::from_secs(3));
+
+    match tls {
+        None => Ok(endpoint),
+        Some(tls) => endpoint
+            .tls_config(tls.clone())
+            .map_err(|source| BalanceError::Tls { source }),
+    }
 }
 
 /// Resolve `host`, build a balanced channel, and KEEP RESOLVING.
@@ -89,22 +237,73 @@ fn endpoint(addr: SocketAddr) -> Endpoint {
 /// long as the channel does; when the channel is dropped the send fails and the
 /// loop exits, so there is no task leak.
 pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
+    connect_with(host, port, None).await
+}
+
+/// [`connect`], with the transport encrypted and the peer verified.
+///
+/// Everything about the balancing is identical — the same resolution, the same
+/// refresh loop, the same timeouts. What changes is that the connection is TLS
+/// and the server's certificate is checked against `host` rather than against
+/// the address the balancer dialled.
+///
+/// **It fails rather than degrades.** A CA bundle that cannot be read, cannot be
+/// decoded, or contains no certificate is an error returned from here, before
+/// any channel exists. There is no path through this function that produces a
+/// cleartext channel.
+///
+/// Server TLS with client-side verification is what this provides. Presenting a
+/// CLIENT certificate — mutual TLS — is a later addition to [`TlsOptions`] and
+/// changes nothing about this signature.
+pub async fn connect_tls(host: &str, port: u16, tls: &TlsOptions) -> Result<Channel, BalanceError> {
+    // BEFORE the DNS lookup, deliberately. A misconfigured bundle is the
+    // operator's mistake and should be reported as itself, not shadowed by
+    // whatever the resolver says about a host they were never going to reach.
+    let prepared = tls.prepare(host)?;
+    connect_with(host, port, Some(prepared)).await
+}
+
+async fn connect_with(
+    host: &str,
+    port: u16,
+    tls: Option<ClientTlsConfig>,
+) -> Result<Channel, BalanceError> {
     let initial = resolve(host, port).await?;
     if initial.is_empty() {
         return Err(BalanceError::NoEndpoints {
             host: host.to_string(),
         });
     }
-    tracing::info!(host, count = initial.len(), "balancing across replicas");
+    // `tls` is recorded because "is this connection encrypted?" must be
+    // answerable from the logs of the process doing the connecting. The
+    // cut-over is a separate change from this one, and an operator has to be
+    // able to see which side of it a given pod is on.
+    tracing::info!(
+        host,
+        count = initial.len(),
+        tls = tls.is_some(),
+        "balancing across replicas"
+    );
 
-    let (channel, tx) = Channel::balance_channel::<SocketAddr>(initial.len().max(8));
-    for addr in &initial {
+    // EVERY endpoint is built BEFORE the channel exists. Building them inside
+    // the send loop would let a late failure return an error after earlier
+    // endpoints had already been pushed into a balancer no caller will ever
+    // receive. `connect_tls` promises that a configuration error is reported
+    // before a channel exists, and that should hold by construction rather than
+    // by the accident that nothing in `endpoint` depends on the address.
+    let built = initial
+        .iter()
+        .map(|addr| Ok((*addr, endpoint(*addr, tls.as_ref())?)))
+        .collect::<Result<Vec<_>, BalanceError>>()?;
+
+    let (channel, tx) = Channel::balance_channel::<SocketAddr>(built.len().max(8));
+    for (addr, built) in built {
         // Before any request is served: a channel with no endpoints yet would
         // fail the first calls while the loop caught up.
-        let _ = tx.send(Change::Insert(*addr, endpoint(*addr))).await;
+        let _ = tx.send(Change::Insert(addr, built)).await;
     }
 
-    tokio::spawn(refresh(host.to_string(), port, initial, tx));
+    tokio::spawn(refresh(host.to_string(), port, initial, tx, tls));
     Ok(channel)
 }
 
@@ -116,6 +315,7 @@ async fn refresh(
     port: u16,
     mut current: BTreeSet<SocketAddr>,
     tx: Sender<Change<SocketAddr, Endpoint>>,
+    tls: Option<ClientTlsConfig>,
 ) {
     loop {
         tokio::time::sleep(RERESOLVE).await;
@@ -147,8 +347,25 @@ async fn refresh(
         for change in diff(&current, &resolved) {
             let sent = match change {
                 Change::Insert(addr, ()) => {
+                    // Defensive: the configuration was already accepted once in
+                    // `connect_tls`, and nothing here depends on the address, so
+                    // this cannot fail for one pod and succeed for another. It
+                    // is written out anyway because the wrong recovery — adding
+                    // the endpoint in cleartext — is the exact downgrade this
+                    // module exists to prevent, and it must not be reachable
+                    // even by accident.
+                    let built = match endpoint(addr, tls.as_ref()) {
+                        Ok(built) => built,
+                        Err(e) => {
+                            tracing::error!(
+                                host, %addr, error = %e,
+                                "could not build a TLS endpoint; the address is skipped rather than dialled in cleartext"
+                            );
+                            continue;
+                        }
+                    };
                     tracing::info!(host, %addr, "endpoint added");
-                    tx.send(Change::Insert(addr, endpoint(addr))).await
+                    tx.send(Change::Insert(addr, built)).await
                 }
                 Change::Remove(addr) => {
                     tracing::info!(host, %addr, "endpoint removed");
@@ -198,4 +415,73 @@ pub enum BalanceError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error(
+        "could not read the CA certificate bundle at {path}: {source}. TLS was \
+         requested, so this is an error rather than a reason to connect in \
+         cleartext."
+    )]
+    CaUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("could not decode the CA certificate bundle at {path}: {source}")]
+    CaUnparsable {
+        path: PathBuf,
+        #[source]
+        source: rustls_pki_types::pem::Error,
+    },
+
+    #[error(
+        "the CA certificate bundle at {path} decoded without error but contains \
+         no certificate. That is not the same as a missing file: the PEM reader \
+         returns an empty list for input with no certificate section, so an \
+         empty or truncated bundle would otherwise produce a trust store with \
+         no roots — which trusts nobody and fails much later, at the handshake."
+    )]
+    CaEmpty { path: PathBuf },
+
+    #[error("TLS could not be configured: {source}")]
+    Tls {
+        #[source]
+        source: tonic::transport::Error,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A REGRESSION GUARD on tonic's rule, not the proof that TLS works — the
+    /// proof is `tests/tls.rs`, which does real handshakes. It is here because
+    /// the failure it catches is silent: tonic's connector switches on the URI
+    /// SCHEME, so an `http://` endpoint carrying a TLS configuration connects in
+    /// cleartext and reports nothing. Nothing about the resulting channel says
+    /// it happened.
+    #[test]
+    fn the_scheme_follows_the_tls_configuration() {
+        let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+
+        let cleartext = endpoint(addr, None).unwrap();
+        assert_eq!(cleartext.uri().scheme_str(), Some("http"));
+
+        let secured = endpoint(addr, Some(&ClientTlsConfig::new().domain_name("task-db")))
+            .expect("a TLS endpoint with a valid domain builds");
+        assert_eq!(secured.uri().scheme_str(), Some("https"));
+    }
+
+    /// A host that is not a name TLS can verify has to be refused. `ServerName`
+    /// rejects it, and the only alternatives are to dial it unverified or to
+    /// dial it in cleartext.
+    #[test]
+    fn a_host_that_is_not_a_valid_server_name_is_refused() {
+        let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+        let tls = ClientTlsConfig::new().domain_name("not a server name");
+        assert!(matches!(
+            endpoint(addr, Some(&tls)),
+            Err(BalanceError::Tls { .. })
+        ));
+    }
 }

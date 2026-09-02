@@ -14,13 +14,36 @@ tonic = { version = "0.14", default-features = false, features = [
   "codegen",
   "transport",
   "channel",
+  # `tls-ring`, NOT `tls-aws-lc`. aws-lc-rs needs cmake and a C toolchain, and
+  # every service that links this crate builds for x86_64-unknown-linux-musl
+  # (D63). ring builds for musl with the toolchain already in the base image.
+  #
+  # NEITHER `tls-native-roots` NOR `tls-webpki-roots` is enabled, deliberately.
+  # Those add the platform trust store, and a private CA that fails to load
+  # would then silently fall back to it — the same class of silent downgrade
+  # this whole change exists to remove, one layer up.
+  "tls-ring",
 ] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tracing = "0.1"
 thiserror = "2"
+# The SAME PEM parser tonic itself uses on the bundle, so "we found N
+# certificates" is exactly what tonic will find. Present in the tree already, by
+# way of tokio-rustls; naming it directly costs nothing and buys the non-empty
+# assertion in `TlsOptions::prepare`.
+rustls-pki-types = { version = "1", features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `router` is a TEST-ONLY feature: the TLS tests need a real gRPC server to
+# handshake against, and `Server::serve` needs a `Routes`. A dev-dependency's
+# features do not reach anything that links this crate, so the shipped
+# dependency tree is unchanged.
+tonic = { version = "0.14", default-features = false, features = ["router"] }
+# Certificates are MINTED PER TEST RUN rather than checked in: a fixture key in
+# the repository is a secret in the repository, and it expires.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints.rust]
 unsafe_code = "forbid"
