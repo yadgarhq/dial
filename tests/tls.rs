@@ -32,40 +32,70 @@ use yadgar_dial::TlsOptions;
 
 mod common;
 
-use common::{bind_all, pki, ready, Pki, TempPem};
+use common::{bind_all, pki, ready, Leaf, Pki, TempPem};
+use rcgen::ExtendedKeyUsagePurpose;
 
 /// The name the test certificates are issued for, and the name the test rig
 /// listens on.
 const SERVED_NAME: &str = "localhost";
 
-/// Serve gRPC over TLS on every address `SERVED_NAME` resolves to, and return
-/// the shared port. `Routes::default()` answers every method with
-/// `Unimplemented`, which is all that is needed: the question each test asks is
-/// whether a request reached the server at all.
-async fn serve(p: &Pki) -> u16 {
+/// The name a client certificate is issued for. It is never dialled and never
+/// verified — nothing checks a client's name today, which is the gap the
+/// deployment records rather than a shortcut taken here — so it exists only to
+/// make the certificate a well-formed one.
+const CALLER_NAME: &str = "yadgar-dial-test-caller";
+
+/// Bind every address `SERVED_NAME` resolves to, on ONE shared port, hand each
+/// listener to `spawn`, and return that port.
+///
+/// The binding itself lives in `common::bind_all`, which retries because a free
+/// port is only knowable after the first bind. `Routes::default()` answers every
+/// method with `Unimplemented`, which is all that is needed: the question each
+/// test asks is whether a request reached the server at all.
+async fn serve_with(spawn: impl Fn(TcpListener)) -> u16 {
     let (listeners, port) = bind_all(SERVED_NAME).await;
     for listener in listeners {
-        spawn_tls_server(listener, p);
+        spawn(listener);
     }
     ready(SERVED_NAME, port).await;
     port
+}
+
+/// Serve gRPC over TLS, verifying nothing about the client.
+async fn serve(p: &Pki) -> u16 {
+    serve_with(|listener| spawn_server(listener, ServerTlsConfig::new().identity(identity(p))))
+        .await
+}
+
+/// Serve gRPC over MUTUAL TLS: a client that presents no certificate, or one
+/// this authority did not issue for `client auth`, is refused at the handshake.
+///
+/// `client_ca_root` is what the internal services gain in a later car, and it
+/// is the whole server side of the seam this suite exercises from the client
+/// side.
+async fn serve_mtls(p: &Pki) -> u16 {
+    serve_with(|listener| {
+        spawn_server(
+            listener,
+            ServerTlsConfig::new()
+                .identity(identity(p))
+                .client_ca_root(tonic::transport::Certificate::from_pem(&p.ca_pem)),
+        )
+    })
+    .await
 }
 
 /// Serve gRPC in CLEARTEXT, for the case that has to keep working untouched.
 async fn serve_cleartext() -> u16 {
-    let (listeners, port) = bind_all(SERVED_NAME).await;
-    for listener in listeners {
-        spawn_cleartext_server(listener);
-    }
-    ready(SERVED_NAME, port).await;
-    port
+    serve_with(spawn_cleartext_server).await
 }
 
-fn spawn_tls_server(listener: TcpListener, p: &Pki) {
-    let identity = Identity::from_pem(&p.cert_pem, &p.key_pem);
-    let mut builder = Server::builder()
-        .tls_config(ServerTlsConfig::new().identity(identity))
-        .unwrap();
+fn identity(p: &Pki) -> Identity {
+    Identity::from_pem(&p.cert_pem, &p.key_pem)
+}
+
+fn spawn_server(listener: TcpListener, tls: ServerTlsConfig) {
+    let mut builder = Server::builder().tls_config(tls).unwrap();
     let router = builder.add_routes(tonic::service::Routes::default());
     tokio::spawn(async move {
         let _ = router
@@ -82,6 +112,12 @@ fn spawn_cleartext_server(listener: TcpListener) {
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await;
     });
+}
+
+/// Write a leaf's certificate and key to disk, because paths are the only shape
+/// [`TlsOptions`] accepts — and the reason it accepts them (D80).
+fn on_disk(leaf: &Leaf) -> (TempPem, TempPem) {
+    (TempPem::with(&leaf.cert_pem), TempPem::with(&leaf.key_pem))
 }
 
 /// Send one gRPC request down the channel and report whether it ARRIVED.
@@ -327,5 +363,180 @@ async fn the_cleartext_path_cannot_reach_a_tls_server() {
     assert!(
         request(channel).await.is_err(),
         "cleartext against a TLS listener must fail"
+    );
+}
+
+/// THE MUTUAL-TLS CASE, and the pair of assertions is the whole test: the same
+/// server, dialled twice, differing only in whether a client certificate was
+/// configured. One arm alone proves nothing — a channel that never presents a
+/// certificate still connects to a server that never asks for one.
+///
+/// Delete `.identity(...)` from `TlsOptions::prepare` and the first assertion
+/// fails, because the server closes the connection on a client that offered
+/// nothing.
+#[tokio::test]
+async fn a_client_certificate_is_presented_when_one_is_configured() {
+    let p = pki(SERVED_NAME);
+    let port = serve_mtls(&p).await;
+    let ca = TempPem::with(&p.ca_pem);
+
+    let client = p.issue(CALLER_NAME, ExtendedKeyUsagePurpose::ClientAuth);
+    let (cert, key) = on_disk(&client);
+    let options = TlsOptions::new(ca.path()).identity(cert.path(), key.path());
+    let channel = yadgar_dial::connect_tls(SERVED_NAME, port, &options)
+        .await
+        .expect("a valid CA bundle, certificate and key");
+    assert_eq!(request(channel).await, Ok(()));
+
+    // The other arm. This is also the proof that presenting a certificate is
+    // OPT-IN: `TlsOptions::new` alone is what every caller ships with today,
+    // and it reaches a server that does not ask.
+    let channel = yadgar_dial::connect_tls(SERVED_NAME, port, &TlsOptions::new(ca.path()))
+        .await
+        .unwrap();
+    assert!(
+        request(channel).await.is_err(),
+        "a server that requires a client certificate must refuse a client with none"
+    );
+}
+
+/// THE PROPERTY THAT REPLACES A SECOND CERTIFICATE AUTHORITY, and it is here
+/// because the deployment's choice rests on it.
+///
+/// One authority — `yadgar-internal-ca` — issues both the serving and the
+/// client certificates. What stops a stolen SERVING certificate being replayed
+/// as a client credential is therefore not a separate issuer but the extended
+/// key usage: rustls verifies a client chain for `client auth`, so a leaf
+/// carrying `server auth` alone is refused even though the authority is
+/// trusted.
+///
+/// A leaf issued for the wrong purpose is exactly what a serving certificate
+/// is when it arrives at the client end of a hop, so this is that attack in
+/// miniature. If it ever starts passing, the deployment needs two authorities.
+#[tokio::test]
+async fn a_certificate_that_is_not_valid_for_client_auth_is_refused() {
+    let p = pki(SERVED_NAME);
+    let port = serve_mtls(&p).await;
+    let ca = TempPem::with(&p.ca_pem);
+
+    let wrong_purpose = p.issue(CALLER_NAME, ExtendedKeyUsagePurpose::ServerAuth);
+    let (cert, key) = on_disk(&wrong_purpose);
+    let options = TlsOptions::new(ca.path()).identity(cert.path(), key.path());
+    let channel = yadgar_dial::connect_tls(SERVED_NAME, port, &options)
+        .await
+        .expect("the material is well-formed; it is the purpose that is wrong");
+    assert!(
+        request(channel).await.is_err(),
+        "a certificate valid only for `server auth` must not authenticate a client, \
+         or one authority for both directions is not safe"
+    );
+}
+
+/// THE OTHER HALF OF THAT PROPERTY, AND IT DOES NOT HOLD. This case pins an
+/// ACCEPTED GAP rather than a guarantee, and it is here so nobody reads the
+/// canary above as proving more than it does.
+///
+/// `a_certificate_that_is_not_valid_for_client_auth_is_refused` covers a leaf
+/// that names the WRONG purpose. It says nothing about a leaf that names NO
+/// purpose, and the two do not behave alike: webpki's `KeyUsage::client_auth()`
+/// is `required_if_present`, not `required`
+/// (`rustls-webpki-0.103.15/src/verify_cert.rs:524`), and an absent extension
+/// takes the accepting branch of that check (`:578-579`). So a leaf carrying no
+/// extended-key-usage extension satisfies a client-auth check. That is not a
+/// corner case — it is exactly what cert-manager issues when `usages` is
+/// omitted from a Certificate.
+///
+/// So the wall the single-authority decision rests on separates NAMED purposes
+/// and accepts a leaf naming none. Any leaf this authority issues without an
+/// extended key usage authenticates a caller, whatever it was meant for. Making
+/// this red — by requiring the extension — is a real change with a real cost,
+/// and it is not taken here; the assertion is the current behaviour, written
+/// down.
+#[tokio::test]
+async fn a_certificate_naming_no_purpose_at_all_is_accepted() {
+    let p = pki(SERVED_NAME);
+    let port = serve_mtls(&p).await;
+    let ca = TempPem::with(&p.ca_pem);
+
+    let no_purpose = p.issue_for(CALLER_NAME, vec![]);
+    let (cert, key) = on_disk(&no_purpose);
+    let options = TlsOptions::new(ca.path()).identity(cert.path(), key.path());
+    let channel = yadgar_dial::connect_tls(SERVED_NAME, port, &options)
+        .await
+        .expect("a valid CA bundle, certificate and key");
+    assert_eq!(
+        request(channel).await,
+        Ok(()),
+        "a leaf with no extended key usage is accepted for client auth today; \
+         if this goes red the gap has been closed and the comment above is stale"
+    );
+}
+
+/// The mistake an operator actually makes is a mount that did not happen, and
+/// the answer to it must name the file rather than surface much later as a
+/// handshake the peer closed.
+///
+/// Both halves, because they are two files and either can be absent alone.
+#[tokio::test]
+async fn a_client_certificate_that_cannot_be_read_is_an_error() {
+    let p = pki(SERVED_NAME);
+    let port = serve_mtls(&p).await;
+    let ca = TempPem::with(&p.ca_pem);
+    let client = p.issue(CALLER_NAME, ExtendedKeyUsagePurpose::ClientAuth);
+    let (cert, key) = on_disk(&client);
+
+    let missing = std::env::temp_dir().join("yadgar-dial-no-such-identity-6c02af.pem");
+
+    let options = TlsOptions::new(ca.path()).identity(&missing, key.path());
+    let outcome = yadgar_dial::connect_tls(SERVED_NAME, port, &options).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(yadgar_dial::BalanceError::ClientCertificateUnreadable { .. })
+        ),
+        "a client certificate path that does not exist must be rejected: {outcome:?}"
+    );
+
+    let options = TlsOptions::new(ca.path()).identity(cert.path(), &missing);
+    let outcome = yadgar_dial::connect_tls(SERVED_NAME, port, &options).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(yadgar_dial::BalanceError::ClientKeyUnreadable { .. })
+        ),
+        "a client key path that does not exist must be rejected: {outcome:?}"
+    );
+}
+
+/// The empty file, which is what a Secret with the wrong key name mounts.
+///
+/// There is deliberately no `ClientCertificateEmpty` variant to match
+/// `CaEmpty`, and the asymmetry has a reason worth pinning: an empty TRUST
+/// STORE is silently permissive-looking and fails much later, whereas an empty
+/// CLIENT CHAIN is refused by rustls where the configuration is BUILT.
+///
+/// THE VARIANT IS ASSERTED, NOT MERELY THAT THIS FAILS, and that is the whole
+/// value of the case. `Tls` is the error `endpoint` returns when the connector
+/// cannot be constructed — observed as `NoCertificatesPresented` — so it says
+/// the material was rejected before any channel existed. A bare `is_err` would
+/// also be satisfied by a channel that dialled anonymously and was refused by
+/// the peer, which is the outcome this asymmetry claims cannot happen. If a
+/// future tonic accepts an empty chain, `connect_tls` returns a channel and
+/// this goes red, which is the point.
+#[tokio::test]
+async fn an_empty_client_certificate_is_an_error_rather_than_an_anonymous_dial() {
+    let p = pki(SERVED_NAME);
+    let port = serve_mtls(&p).await;
+    let ca = TempPem::with(&p.ca_pem);
+    let client = p.issue(CALLER_NAME, ExtendedKeyUsagePurpose::ClientAuth);
+    let (_cert, key) = on_disk(&client);
+
+    let empty = TempPem::with("");
+    let options = TlsOptions::new(ca.path()).identity(empty.path(), key.path());
+    let outcome = yadgar_dial::connect_tls(SERVED_NAME, port, &options).await;
+    assert!(
+        matches!(outcome, Err(yadgar_dial::BalanceError::Tls { .. })),
+        "an empty client certificate must be refused where the connector is built, \
+         not produce a channel that dials anonymously: {outcome:?}"
     );
 }

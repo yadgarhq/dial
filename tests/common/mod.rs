@@ -26,10 +26,59 @@ use rcgen::{
 };
 
 /// A certificate authority and one certificate it issued.
+///
+/// The authority is KEPT rather than dropped after that first leaf, because
+/// mutual TLS needs a second leaf — the client's — issued by THE SAME
+/// authority. Two calls to [`pki`] produce two unrelated roots, which is the
+/// right rig for `a_certificate_from_an_untrusted_authority_is_refused` and
+/// exactly the wrong one for every mutual-TLS case.
 pub struct Pki {
     pub ca_pem: String,
     pub cert_pem: String,
     pub key_pem: String,
+    issuer: CertifiedIssuer<'static, KeyPair>,
+}
+
+/// A certificate and its private key, issued by an existing [`Pki`].
+pub struct Leaf {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+impl Pki {
+    /// Issue a further leaf from this authority, valid for `purpose` alone.
+    ///
+    /// **THE PURPOSE IS A PARAMETER BECAUSE IT IS LOAD-BEARING, not so a test
+    /// can vary it.** One authority issues both the serving and the client
+    /// certificates in this estate, and what stops a serving certificate being
+    /// replayed as a client credential is that rustls verifies a client chain
+    /// for `client auth` and a server chain for `server auth`. A rig that
+    /// issued every leaf for both purposes would pass against a deployment
+    /// with no separation at all.
+    pub fn issue(&self, san: &str, purpose: ExtendedKeyUsagePurpose) -> Leaf {
+        self.issue_for(san, vec![purpose])
+    }
+
+    /// Issue a leaf naming EXACTLY `purposes`, including none at all.
+    ///
+    /// The empty case is the one this exists for, and it is not a variation on
+    /// the above: an empty vector makes rcgen omit the extended-key-usage
+    /// extension entirely rather than emit an empty one
+    /// (`rcgen-0.14.10/src/certificate.rs:238`), which is what a leaf
+    /// issued with no `usages` looks like. See
+    /// `a_certificate_naming_no_purpose_at_all_is_accepted` for why that shape
+    /// has to be pinned rather than assumed away.
+    pub fn issue_for(&self, san: &str, purposes: Vec<ExtendedKeyUsagePurpose>) -> Leaf {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![san.to_string()]).unwrap();
+        params.extended_key_usages = purposes;
+        params.distinguished_name.push(DnType::CommonName, san);
+        let cert = params.signed_by(&key, &self.issuer).unwrap();
+        Leaf {
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        }
+    }
 }
 
 /// Mint a CA and a server certificate whose ONLY subject alternative name is
@@ -60,6 +109,7 @@ pub fn pki(san: &str) -> Pki {
         ca_pem: ca.pem(),
         cert_pem: cert.pem(),
         key_pem: key.serialize_pem(),
+        issuer: ca,
     }
 }
 
