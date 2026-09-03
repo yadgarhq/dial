@@ -7,14 +7,18 @@
 //! machine, so a rig that binds one of them is flaky by construction.
 //!
 //! The servers themselves are NOT here: one suite serves and the other refuses
-//! to, which is the whole difference between them.
+//! to, which is the whole difference between them. [`bind_all`] therefore hands
+//! back LISTENERS and leaves the serving to the caller.
 //!
 //! `allow(dead_code)` because each integration test binary compiles this module
 //! separately, so anything only one of them uses looks unused to the other.
 #![allow(dead_code)]
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use tokio::net::TcpListener;
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -87,6 +91,58 @@ impl Drop for TempPem {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// How many ports to try before giving up on finding one free everywhere.
+const BIND_ATTEMPTS: usize = 32;
+
+/// Bind ONE free port on EVERY address `host` resolves to, and hand back the
+/// listeners together with that port.
+///
+/// **Three call sites grew their own copy of this and had already drifted**: one
+/// had lost the "resolved to nothing" assertion its siblings kept, and reported
+/// a port collision through a bare `unwrap`. It lives here now, which is what
+/// this module exists for.
+///
+/// **THE RACE, and why the retry is not decoration.** A free port is only
+/// knowable AFTER the first bind, so between reading it and binding the same
+/// port on the name's other addresses another process can take it — and nothing
+/// reserves a port across several addresses at once. So the attempt drops
+/// everything it holds and asks for a different port. Under a parallel
+/// `cargo test` that collision is real rather than theoretical.
+pub async fn bind_all(host: &str) -> (Vec<TcpListener>, u16) {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
+        .await
+        .unwrap_or_else(|e| panic!("{host} could not be resolved: {e}"))
+        .collect();
+    assert!(!addrs.is_empty(), "{host} resolved to nothing");
+
+    for _ in 0..BIND_ATTEMPTS {
+        if let Some(bound) = bind_once(&addrs).await {
+            return bound;
+        }
+    }
+    panic!("no port was free on every address of {host} after {BIND_ATTEMPTS} attempts");
+}
+
+/// One attempt: a free port on the first address, then the SAME port on the
+/// rest. `None` means somebody else already holds it on one of the others, which
+/// is the caller's cue to try a different port.
+async fn bind_once(addrs: &[SocketAddr]) -> Option<(Vec<TcpListener>, u16)> {
+    let first = TcpListener::bind(addrs[0])
+        .await
+        .unwrap_or_else(|e| panic!("no free port on {}: {e}", addrs[0]));
+    let port = first.local_addr().unwrap().port();
+
+    let mut listeners = vec![first];
+    for addr in &addrs[1..] {
+        match TcpListener::bind(SocketAddr::new(addr.ip(), port)).await {
+            Ok(listener) => listeners.push(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return None,
+            Err(e) => panic!("binding {} on port {port}: {e}", addr.ip()),
+        }
+    }
+    Some((listeners, port))
 }
 
 /// Wait until the port accepts a TCP connection, rather than sleeping a

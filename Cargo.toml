@@ -32,9 +32,25 @@ thiserror = "2"
 # way of tokio-rustls; naming it directly costs nothing and buys the non-empty
 # assertion in `TlsOptions::prepare`.
 rustls-pki-types = { version = "1", features = ["std"] }
+# For `RootCertStore::add_parsable_certificates` ALONE, so the CA bundle can be
+# asserted non-empty the way tonic will actually build it. tonic feeds the PEM
+# through `CertificateDer::pem_reader_iter` into `add_parsable_certificates` and
+# DISCARDS the return (`tonic-0.14.6/src/transport/channel/service/tls.rs:104`),
+# so a bundle whose sections all fail to parse as a trust anchor yields the empty
+# root store with no error. Counting PEM sections cannot see that.
+#
+# `default-features = false` with `std` alone: NO crypto provider is pulled in
+# here. tonic already chooses `ring` through `tls-ring`, and a second provider in
+# the tree is how a build acquires an ambiguous default.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util` is a TEST-ONLY feature: the `refresh` loop sleeps `RERESOLVE`
+# between ticks, so a test of it either takes five seconds per tick or runs on a
+# paused clock. `start_paused = true` makes every case here deterministic and
+# sub-millisecond. A dev-dependency's features do not reach anything that links
+# this crate, so the shipped dependency tree is unchanged.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 # `router` is a TEST-ONLY feature: the TLS tests need a real gRPC server to
 # handshake against, and `Server::serve` needs a `Routes`. A dev-dependency's
 # features do not reach anything that links this crate, so the shipped

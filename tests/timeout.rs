@@ -22,11 +22,11 @@
 //! passing on the floor.
 //!
 //! NOTE ON `localhost`: it resolves to BOTH `::1` and `127.0.0.1` here, so
-//! `serve` binds every address the name resolves to, on one port. A rig binding
-//! one of them leaves the balancer holding an endpoint nothing is listening on.
+//! `common::bind_all` binds every address the name resolves to, on one port. A
+//! rig binding one of them leaves the balancer holding an endpoint nothing is
+//! listening on.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -40,7 +40,7 @@ use yadgar_dial::TlsOptions;
 
 mod common;
 
-use common::{pki, ready, Pki, TempPem};
+use common::{bind_all, pki, ready, Pki, TempPem};
 
 /// The name the test certificates are issued for, and the name the rig listens
 /// on.
@@ -93,23 +93,10 @@ impl Service<http::Request<Body>> for NeverAnswers {
 /// Serve [`NeverAnswers`] on every address `SERVED_NAME` resolves to, over TLS
 /// when a `Pki` is given and in cleartext otherwise, and return the shared port.
 async fn serve(tls: Option<&Pki>) -> u16 {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((SERVED_NAME, 0))
-        .await
-        .unwrap()
-        .collect();
-    assert!(!addrs.is_empty(), "{SERVED_NAME} resolved to nothing");
-
-    let first = TcpListener::bind(addrs[0]).await.unwrap();
-    let port = first.local_addr().unwrap().port();
-    spawn(first, tls);
-
-    for addr in &addrs[1..] {
-        let listener = TcpListener::bind(SocketAddr::new(addr.ip(), port))
-            .await
-            .expect("the same free port on a second address of the same name");
+    let (listeners, port) = bind_all(SERVED_NAME).await;
+    for listener in listeners {
         spawn(listener, tls);
     }
-
     ready(SERVED_NAME, port).await;
     port
 }

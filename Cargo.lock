@@ -1096,6 +1096,7 @@ name = "yadgar-dial"
 version = "0.1.0"
 dependencies = [
  "rcgen",
+ "rustls",
  "rustls-pki-types",
  "thiserror",
  "tokio",

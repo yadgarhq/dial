@@ -18,11 +18,10 @@
 //!
 //! NOTE ON `localhost`: it is the one name that resolves without touching
 //! `/etc/hosts`, and on this machine it resolves to BOTH `::1` and `127.0.0.1`.
-//! `serve` therefore binds every address the name resolves to, on one port, so
-//! the balancer never holds an endpoint nothing is listening on. That is a
-//! property of the test rig, not of the crate.
+//! `common::bind_all` therefore binds every address the name resolves to, on one
+//! port, so the balancer never holds an endpoint nothing is listening on. That is
+//! a property of the test rig, not of the crate.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -33,7 +32,7 @@ use yadgar_dial::TlsOptions;
 
 mod common;
 
-use common::{pki, ready, Pki, TempPem};
+use common::{bind_all, pki, ready, Pki, TempPem};
 
 /// The name the test certificates are issued for, and the name the test rig
 /// listens on.
@@ -44,40 +43,18 @@ const SERVED_NAME: &str = "localhost";
 /// `Unimplemented`, which is all that is needed: the question each test asks is
 /// whether a request reached the server at all.
 async fn serve(p: &Pki) -> u16 {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((SERVED_NAME, 0))
-        .await
-        .unwrap()
-        .collect();
-    assert!(!addrs.is_empty(), "{SERVED_NAME} resolved to nothing");
-
-    let first = TcpListener::bind(addrs[0]).await.unwrap();
-    let port = first.local_addr().unwrap().port();
-    spawn_tls_server(first, p);
-
-    for addr in &addrs[1..] {
-        let listener = TcpListener::bind(SocketAddr::new(addr.ip(), port))
-            .await
-            .expect("the same free port on a second address of the same name");
+    let (listeners, port) = bind_all(SERVED_NAME).await;
+    for listener in listeners {
         spawn_tls_server(listener, p);
     }
-
     ready(SERVED_NAME, port).await;
     port
 }
 
 /// Serve gRPC in CLEARTEXT, for the case that has to keep working untouched.
 async fn serve_cleartext() -> u16 {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((SERVED_NAME, 0))
-        .await
-        .unwrap()
-        .collect();
-    let first = TcpListener::bind(addrs[0]).await.unwrap();
-    let port = first.local_addr().unwrap().port();
-    spawn_cleartext_server(first);
-    for addr in &addrs[1..] {
-        let listener = TcpListener::bind(SocketAddr::new(addr.ip(), port))
-            .await
-            .unwrap();
+    let (listeners, port) = bind_all(SERVED_NAME).await;
+    for listener in listeners {
         spawn_cleartext_server(listener);
     }
     ready(SERVED_NAME, port).await;
@@ -250,6 +227,48 @@ async fn a_ca_bundle_with_no_certificate_in_it_is_an_error() {
             "a bundle containing {contents:?} must be rejected, not connected: {outcome:?}"
         );
     }
+}
+
+/// THE CASE A SECTION COUNT CANNOT SEE: a bundle that decodes as PEM and yields
+/// no trust anchor at all.
+///
+/// The body here is a real private key's base64 wrapped in CERTIFICATE headers —
+/// valid framing, valid base64, and DER that is not a certificate.
+/// `CertificateDer`'s PEM reader hands it over without complaint, because it
+/// decodes bytes and does not look at them, so a check that counts PEM sections
+/// sees a healthy `1`.
+///
+/// tonic then feeds those same DERs to `add_parsable_certificates`, which throws
+/// away what it cannot parse and reports how much — and tonic discards the
+/// report with no check after it. The result is the empty root store `CaEmpty`
+/// exists to prevent, reached by a path `CaEmpty` never covered.
+///
+/// The section count is asserted too, not only the variant: `sections: 1` is what
+/// makes it this case rather than the empty-file one.
+#[tokio::test]
+async fn a_ca_bundle_whose_sections_are_not_trust_anchors_is_an_error() {
+    let p = pki(SERVED_NAME);
+    let port = serve(&p).await;
+
+    let body = p
+        .key_pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ca = TempPem::with(&format!(
+        "-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n"
+    ));
+
+    let outcome = yadgar_dial::connect_tls(SERVED_NAME, port, &TlsOptions::new(ca.path())).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(yadgar_dial::BalanceError::CaNoTrustAnchor { sections: 1, .. })
+        ),
+        "a bundle holding one PEM section and no trust anchor must be rejected, not connected: \
+         {outcome:?}"
+    );
 }
 
 /// A path that is not there at all. The mistake an operator actually makes is a
