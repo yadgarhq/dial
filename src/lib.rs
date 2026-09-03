@@ -29,7 +29,16 @@
 //! A headless Service briefly returns nothing during some rollouts, and removing
 //! every endpoint on that basis is a self-inflicted outage from a transient DNS
 //! answer. `diff` itself has no such opinion — it is pure — so the guard lives in
-//! the loop and the test for the recovering-from-zero case lives here.
+//! the loop.
+//!
+//! **WHERE THAT IS AND IS NOT TESTED, spelled out because this paragraph used to
+//! name a test that does not exist.** Recovering from zero IS covered, at the
+//! `diff` level, by
+//! `tests/balance.rs::recovering_from_an_empty_set_inserts_everything`. The
+//! loop's OWN `resolved.is_empty()` guard — that an empty answer removes nothing
+//! — has no test. `mod tests` below covers the loop's exit and its bookkeeping
+//! of what the balancer was given, not the effect of that branch on the endpoint
+//! set.
 //!
 //! # TLS
 //!
@@ -55,22 +64,31 @@
 //! difference — which is the point.
 //!
 //! **A misconfiguration is an error, never a downgrade.** An unreadable bundle,
-//! an undecodable one, and one that contains no certificate all fail at
-//! [`connect_tls`]. Nothing here falls back to cleartext, and nothing here falls
-//! back to the platform trust store.
+//! an undecodable one, one that contains no certificate, and one whose sections
+//! decode as PEM and yield no usable trust anchor all fail at [`connect_tls`].
+//! The last of those is the one worth naming: it is the case a count of PEM
+//! sections cannot see, and it produces the same rootless trust store as an empty
+//! file while looking healthy. Nothing here falls back to cleartext, and nothing
+//! here falls back to the platform trust store.
 //!
 //! # Timeouts
 //!
-//! Three bounds, on three different things, and the distinction is the whole
-//! reason the third one exists.
+//! Four bounds, on four different things, and the distinction is the whole reason
+//! each of the last two exists.
 //!
 //! | bound | what it catches |
 //! | --- | --- |
+//! | `RESOLVE_TIMEOUT` | a resolver that stopped answering, BEFORE any connection |
 //! | `connect_timeout` | a TCP connect that does not complete |
 //! | HTTP/2 keepalive | a peer that VANISHED without closing its connection |
 //! | [`default_request_timeout`] | a peer that is alive, connected, answering pings, and never replies |
 //!
-//! **The third was missing, and nothing else covers it.** A `-db` blocked on its
+//! **The first bounds a phase the other three never reach.** Every entry point
+//! resolves before it builds anything, so a wedged resolver held `connect` open
+//! for ever with nothing to report — and most callers here connect eagerly at
+//! boot, which makes that a process that starts and never finishes starting.
+//!
+//! **The last was missing too, and nothing else covers it.** A `-db` blocked on its
 //! engine connects fine, pings fine, and holds every caller's handler open
 //! indefinitely — which is also why a `tcpSocket` readiness probe stays green
 //! straight through it. [`connect`] and [`connect_tls`] apply a default;
@@ -78,6 +96,7 @@
 //! take the caller's own.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -128,6 +147,26 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// call through `dial` is a single query away from its answer and finishes
 /// three orders of magnitude inside this.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long ONE resolution may take before it is abandoned.
+///
+/// **`connect_with` awaits a resolution before anything else exists**, and three
+/// of the four callers in this estate connect eagerly at boot. An unbounded
+/// lookup against a wedged resolver is therefore a process that starts and then
+/// never finishes starting — a silent startup hang rather than a crash loop, so
+/// no restart policy notices and nothing is logged.
+///
+/// **WHAT THIS DOES NOT FIX, said rather than left to be discovered.** A `String`
+/// target is resolved on the blocking pool — `spawn_blocking(getaddrinfo)`,
+/// `tokio-1.53.1/src/net/addr.rs:182,219` — and a blocking task cannot be
+/// cancelled. This bound releases the CALLER; the abandoned thread stays parked
+/// until the resolver answers or the process ends. The hang is fixed. The pool
+/// drain is only mitigated.
+///
+/// Five seconds is one `RERESOLVE` tick: a wedged resolver costs the refresh loop
+/// at most a doubled interval, and costs startup an error instead of a wait with
+/// no end.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What changed between two resolutions.
 ///
@@ -223,6 +262,31 @@ impl TlsOptions {
             });
         }
 
+        // AND THE ASSERTION A SECTION COUNT CANNOT MAKE. The check above counts
+        // PEM SECTIONS. What has to be non-empty is the ROOT STORE, and the two
+        // part company for a bundle whose sections decode as PEM and then fail
+        // to parse as a trust anchor — a key pasted under a CERTIFICATE header,
+        // a truncated DER body. tonic hands exactly these DERs to
+        // `add_parsable_certificates` and DISCARDS its `(accepted, rejected)`
+        // return with no check after it
+        // (`tonic-0.14.6/src/transport/channel/service/tls.rs:104`), so such a
+        // bundle yields precisely the rootless trust store this function exists
+        // to prevent, and the section count sees a healthy `1`.
+        //
+        // The store is built HERE, the way tonic will build it, and then
+        // dropped: tonic accepts a PEM bundle rather than a store, so what this
+        // buys is the answer to "how many roots will that produce", asked before
+        // a channel exists instead of never.
+        let sections = certificates.len();
+        let mut roots = rustls::RootCertStore::empty();
+        let (accepted, _rejected) = roots.add_parsable_certificates(certificates);
+        if accepted == 0 {
+            return Err(BalanceError::CaNoTrustAnchor {
+                path: self.ca_certificate.clone(),
+                sections,
+            });
+        }
+
         Ok(ClientTlsConfig::new()
             // The host, NOT the address that gets dialled.
             .domain_name(self.domain_name.as_deref().unwrap_or(host))
@@ -291,8 +355,16 @@ fn endpoint(
 /// does not move, so it adds more.
 ///
 /// The task holds a `Sender` into the channel's discovery stream and lives as
-/// long as the channel does; when the channel is dropped the send fails and the
-/// loop exits, so there is no task leak.
+/// long as the channel does. It ends by POLLING `Sender::is_closed` at the top of
+/// every tick, and naming the mechanism matters: this paragraph used to say the
+/// loop ended because "the send fails", which was false on the two commonest
+/// ticks. A stable endpoint set and an empty resolution both skip the send
+/// entirely, so a loop that learned of a dropped channel only from a failed send
+/// never learned of it at all and re-resolved a dead channel's host for the life
+/// of the process.
+///
+/// The bound is ONE `RERESOLVE` tick rather than instant: the task is asleep when
+/// the channel is dropped, and notices when it next wakes.
 ///
 /// Requests are bounded by [`default_request_timeout`]. A caller that needs its
 /// own bound uses [`connect_with_request_timeout`].
@@ -335,9 +407,9 @@ pub async fn connect_with_request_timeout(
 /// the address the balancer dialled.
 ///
 /// **It fails rather than degrades.** A CA bundle that cannot be read, cannot be
-/// decoded, or contains no certificate is an error returned from here, before
-/// any channel exists. There is no path through this function that produces a
-/// cleartext channel.
+/// decoded, contains no certificate, or yields no usable trust anchor is an error
+/// returned from here, before any channel exists. There is no path through this
+/// function that produces a cleartext channel.
 ///
 /// Server TLS with client-side verification is what this provides. Presenting a
 /// CLIENT certificate — mutual TLS — is a later addition to [`TlsOptions`] and
@@ -413,6 +485,9 @@ async fn connect_with(
         tx,
         tls,
         request_timeout,
+        // The production resolver. `refresh` takes it as a parameter rather
+        // than calling `resolve` itself — see there for why the seam exists.
+        |host, port| async move { resolve(&host, port).await },
     ));
     Ok(channel)
 }
@@ -420,18 +495,54 @@ async fn connect_with(
 /// The loop. Separate from `connect` so a failed resolution never takes down a
 /// channel that is still serving: DNS blipping is not a reason to stop using
 /// endpoints that currently work.
-async fn refresh(
+///
+/// **`resolver` IS A PARAMETER BECAUSE THIS FUNCTION HAD NO SEAM, and that is
+/// why two defects lived in twenty lines of it.** The loop called `resolve`
+/// directly and slept `RERESOLVE` — five seconds — between ticks, while the
+/// integration suites finish in under three. A probe placed after the sleep took
+/// zero hits across all fourteen of them: no branch of this function was ever
+/// executed by a test, and a doc comment on `connect` claiming the opposite of
+/// what this code did went unchallenged through review.
+///
+/// A GENERIC rather than a function pointer: an `async fn`'s future type cannot
+/// be named, so a `fn` pointer would force a boxed future and an allocation on
+/// every tick for a seam only tests use. The parameter never reaches the public
+/// API, because `refresh` is private and `connect_with` supplies it.
+///
+/// **`current` is what the balancer HAS BEEN GIVEN, not what DNS last said**, and
+/// the distinction is the second defect. An endpoint whose `Endpoint` fails to
+/// build is skipped; recording it as present anyway means `diff` never offers it
+/// again, so one transient failure to build an address removes that pod from the
+/// balancer permanently. "Given" here means handed to the discovery channel — the
+/// balancer applies it from there — so this tracks the sends that succeeded,
+/// never the resolution that prompted them.
+async fn refresh<R, F>(
     host: String,
     port: u16,
     mut current: BTreeSet<SocketAddr>,
     tx: Sender<Change<SocketAddr, Endpoint>>,
     tls: Option<ClientTlsConfig>,
     request_timeout: Duration,
-) {
+    resolver: R,
+) where
+    R: Fn(String, u16) -> F,
+    F: Future<Output = Result<BTreeSet<SocketAddr>, BalanceError>>,
+{
     loop {
         tokio::time::sleep(RERESOLVE).await;
 
-        let resolved = match resolve(&host, port).await {
+        // THE EXIT, and it is a poll rather than a failed send deliberately.
+        // The two commonest ticks — a stable endpoint set, and an empty
+        // resolution that must be ignored — send NOTHING, so a loop that
+        // learned about a dropped channel only from `tx.send` returning an
+        // error would go on resolving for the life of the process. Asking here
+        // also spares a dead channel's host one DNS lookup per tick.
+        if tx.is_closed() {
+            tracing::debug!(host, "channel dropped; ending re-resolution");
+            return;
+        }
+
+        let resolved = match resolver(host.clone(), port).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(host, error = %e, "re-resolution failed; keeping the current endpoints");
@@ -456,7 +567,7 @@ async fn refresh(
         }
 
         for change in diff(&current, &resolved) {
-            let sent = match change {
+            match change {
                 Change::Insert(addr, ()) => {
                     // Defensive: the configuration was already accepted once in
                     // `connect_tls`, and nothing here depends on the address, so
@@ -472,37 +583,67 @@ async fn refresh(
                                 host, %addr, error = %e,
                                 "could not build a TLS endpoint; the address is skipped rather than dialled in cleartext"
                             );
+                            // AND NOT RECORDED. `current` advances only where a
+                            // send succeeded, so this address is still missing
+                            // from it next tick and `diff` offers it again.
                             continue;
                         }
                     };
+                    // The receiver is gone, so the channel was dropped: stop
+                    // rather than spin against a dead sender. The check at the
+                    // top of the tick does not replace this one — the receiver
+                    // can be dropped part-way through a batch of changes.
+                    if tx.send(Change::Insert(addr, built)).await.is_err() {
+                        tracing::debug!(host, "channel dropped; ending re-resolution");
+                        return;
+                    }
+                    current.insert(addr);
                     tracing::info!(host, %addr, "endpoint added");
-                    tx.send(Change::Insert(addr, built)).await
                 }
                 Change::Remove(addr) => {
+                    if tx.send(Change::Remove(addr)).await.is_err() {
+                        tracing::debug!(host, "channel dropped; ending re-resolution");
+                        return;
+                    }
+                    current.remove(&addr);
                     tracing::info!(host, %addr, "endpoint removed");
-                    tx.send(Change::Remove(addr)).await
                 }
-            };
-            // The receiver is gone, so the channel was dropped: stop rather than
-            // spin forever against a dead sender.
-            if sent.is_err() {
-                tracing::debug!("channel dropped; ending re-resolution");
-                return;
             }
         }
-        current = resolved;
     }
 }
 
 async fn resolve(host: &str, port: u16) -> Result<BTreeSet<SocketAddr>, BalanceError> {
     let target = format!("{host}:{port}");
-    let addrs = tokio::net::lookup_host(target.clone())
-        .await
-        .map_err(|source| BalanceError::Dns {
+    bounded_lookup(target.clone(), tokio::net::lookup_host(target)).await
+}
+
+/// The bound, separated from `tokio::net::lookup_host` so a lookup that never
+/// answers can be handed to it directly.
+///
+/// What changed is not that a timeout exists — it is that a resolver which
+/// STOPPED ANSWERING becomes a named error, distinct from a name that does not
+/// exist. Those are different operator situations: NXDOMAIN answers, and answers
+/// promptly. See [`RESOLVE_TIMEOUT`] for what the bound does and does not free.
+async fn bounded_lookup<I, F>(
+    target: String,
+    lookup: F,
+) -> Result<BTreeSet<SocketAddr>, BalanceError>
+where
+    I: Iterator<Item = SocketAddr>,
+    F: Future<Output = std::io::Result<I>>,
+{
+    match tokio::time::timeout(RESOLVE_TIMEOUT, lookup).await {
+        Err(_) => Err(BalanceError::DnsTimedOut {
+            host: target,
+            after: RESOLVE_TIMEOUT,
+        }),
+        Ok(Err(source)) => Err(BalanceError::Dns {
             host: target,
             source,
-        })?;
-    Ok(addrs.collect())
+        }),
+        Ok(Ok(addrs)) => Ok(addrs.collect()),
+    }
 }
 
 /// The interval at which endpoints are re-resolved. Exposed so a caller can log
@@ -527,6 +668,16 @@ pub enum BalanceError {
          which under D69 includes failing their capability probe or migrations."
     )]
     NoEndpoints { host: String },
+
+    #[error(
+        "resolving {host} did not finish within {after:?}. This is NOT a name \
+         that does not exist — that answers, and answers quickly. It is a \
+         resolver that stopped answering at all, and the caller is released \
+         rather than left waiting with no end. The lookup itself runs on the \
+         blocking pool and cannot be cancelled: that thread stays parked until \
+         the resolver replies."
+    )]
+    DnsTimedOut { host: String, after: Duration },
 
     #[error("could not resolve {host}: {source}")]
     Dns {
@@ -562,6 +713,18 @@ pub enum BalanceError {
     )]
     CaEmpty { path: PathBuf },
 
+    #[error(
+        "the CA certificate bundle at {path} holds {sections} PEM certificate \
+         section(s) and NONE of them is a usable trust anchor. That is not the \
+         same as an empty bundle: the sections are present and they decode as \
+         PEM, so counting them says the file is fine. tonic builds its root \
+         store with `add_parsable_certificates`, which reports how many it \
+         accepted and how many it threw away, and discards that report — so a \
+         bundle like this one produces a trust store with no roots and no error, \
+         and fails much later, at the handshake."
+    )]
+    CaNoTrustAnchor { path: PathBuf, sections: usize },
+
     #[error("TLS could not be configured: {source}")]
     Tls {
         #[source]
@@ -571,7 +734,153 @@ pub enum BalanceError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::*;
+
+    /// A resolver that never fails and always answers with `set`.
+    fn always(
+        set: BTreeSet<SocketAddr>,
+    ) -> impl Fn(String, u16) -> std::future::Ready<Result<BTreeSet<SocketAddr>, BalanceError>>
+    {
+        move |_host, _port| std::future::ready(Ok(set.clone()))
+    }
+
+    /// THE LEAK. A stable endpoint set, and a receiver nobody holds any more.
+    ///
+    /// **This fails against the loop that learned about a dropped channel only
+    /// from a failed `tx.send`.** A stable set produces no changes, so nothing is
+    /// ever sent, so the failure never happens: measured, that loop was still
+    /// re-resolving after twelve seconds — more than two ticks — against a
+    /// channel nobody holds, and would have gone on for the life of the process.
+    ///
+    /// The DNS-error and empty-resolution branches need no case of their own.
+    /// The check that ends the loop sits ABOVE all three, before a resolution is
+    /// even attempted, so one branch proves it for all of them.
+    ///
+    /// On a paused clock the runtime jumps to the next deadline, so a loop that
+    /// exits does so at its first tick and this case costs no wall-clock time.
+    /// The sixty-second ceiling is the failure mode being asserted against: "it
+    /// never ended", not "it was slow".
+    #[tokio::test(start_paused = true)]
+    async fn stable_endpoint_set_exits_on_channel_drop() {
+        let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+        let stable = BTreeSet::from([addr]);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        // The channel `connect` would have returned, and the caller is done with
+        // it. `current` is seeded with what resolves, so every tick is a stable
+        // one and no send is ever attempted.
+        drop(rx);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            refresh(
+                "task-db".to_string(),
+                50051,
+                stable.clone(),
+                tx,
+                None,
+                REQUEST_TIMEOUT,
+                always(stable),
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "the loop must end when the channel is dropped, including on a tick that sends nothing"
+        );
+    }
+
+    /// An endpoint that FAILED TO BUILD must not be recorded as one the balancer
+    /// was given.
+    ///
+    /// The defect is invisible on the tick where it happens — nothing is sent
+    /// either way — and surfaces on the NEXT one. A `current` advanced to the
+    /// resolved set holds an address the balancer never received, so when that
+    /// address goes away the loop sends a `Remove` for it. This case watches for
+    /// exactly that removal, and for anything else reaching a balancer that was
+    /// given nothing.
+    ///
+    /// Every build fails here, by way of a domain name `ServerName` refuses —
+    /// the same lever `a_host_that_is_not_a_valid_server_name_is_refused` pulls.
+    /// That makes the failure total and independent of which address is being
+    /// built.
+    #[tokio::test(start_paused = true)]
+    async fn an_endpoint_that_fails_to_build_is_not_recorded_as_given() {
+        let first: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+        let second: SocketAddr = "10.0.0.2:50051".parse().unwrap();
+
+        // The receiver stays ALIVE across both ticks. Dropping it would end the
+        // loop at the top of tick two, before the tick that matters.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let tick = Arc::new(AtomicUsize::new(0));
+        let resolver = move |_host: String, _port: u16| {
+            let n = tick.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(BTreeSet::from([if n == 0 { first } else { second }])))
+        };
+
+        // Nothing can be built with this: every `endpoint` call fails before any
+        // send.
+        let unbuildable = ClientTlsConfig::new().domain_name("not a server name");
+
+        // Two ticks, then the loop is abandoned. The timeout expiring is the
+        // expected outcome — the channel is alive, so the loop is meant to keep
+        // running — and the assertion is on what reached the receiver.
+        let _ = tokio::time::timeout(
+            RERESOLVE * 2 + Duration::from_secs(1),
+            refresh(
+                "task-db".to_string(),
+                50051,
+                BTreeSet::new(),
+                tx,
+                Some(unbuildable),
+                REQUEST_TIMEOUT,
+                resolver,
+            ),
+        )
+        .await;
+
+        let mut observed = Vec::new();
+        while let Ok(change) = rx.try_recv() {
+            observed.push(match change {
+                Change::Insert(addr, _) => format!("insert {addr}"),
+                Change::Remove(addr) => format!("remove {addr}"),
+            });
+        }
+        assert!(
+            observed.is_empty(),
+            "no endpoint could be built, so the balancer was given nothing — and a removal here \
+             takes away an address it never had: {observed:?}"
+        );
+    }
+
+    /// A resolver that stops answering has to become an error, and one that says
+    /// what happened rather than borrowing NXDOMAIN's name.
+    ///
+    /// The outer ceiling is what makes the failure legible: without the bound
+    /// inside `bounded_lookup` there is nothing to end the wait, and this case
+    /// would otherwise hang instead of failing.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_never_answers_is_bounded_and_named() {
+        let outcome = tokio::time::timeout(
+            RESOLVE_TIMEOUT * 12,
+            bounded_lookup(
+                "task-db:50051".to_string(),
+                std::future::pending::<std::io::Result<std::vec::IntoIter<SocketAddr>>>(),
+            ),
+        )
+        .await
+        .expect("the lookup must be bounded from inside, not by this case's own ceiling");
+
+        assert!(
+            matches!(outcome, Err(BalanceError::DnsTimedOut { .. })),
+            "a resolver that stopped answering must be reported as itself: {outcome:?}"
+        );
+    }
 
     /// A REGRESSION GUARD on tonic's rule, not the proof that TLS works — the
     /// proof is `tests/tls.rs`, which does real handshakes. It is here because
