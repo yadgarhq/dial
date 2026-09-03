@@ -19,11 +19,47 @@ on:
     tags: ["v*"]
 
 jobs:
+  # THE PULL REQUEST GATE, AND IT CARRIES NO CREDENTIAL. `ci-pr.yaml` serves both
+  # events, so one job calling it for both handed the release App's private key
+  # to every pull-request run — a run that builds and tests the branch's own
+  # code. These are branch pull requests rather than fork ones, so GitHub does
+  # pass secrets to them, and the App holds `Contents: Read and write` on every
+  # repository in the organisation.
+  #
+  # The pull request has no use for it either: `version` is the only job that
+  # reads those secrets, and its own condition is `push` to `refs/heads/main`.
+  # So the split costs nothing and removes the whole exposure.
+  #
+  # THE NAME `ci` IS LOAD-BEARING. The ruleset on `main` requires the check
+  # `ci / passed`, which is `<caller job id> / <called job id>` — renaming this
+  # job breaks the merge gate rather than reporting anything.
   ci:
-    if: "!startsWith(github.ref, 'refs/tags/')"
+    if: github.event_name == 'pull_request'
     uses: yadgarhq/actions/.github/workflows/ci-pr.yaml@main
     permissions:
       contents: read
+
+  # THE SAME SHARED WORKFLOW ON THE PUSH PATH, where the credential is needed
+  # and where nothing unreviewed runs. A push to `main` here is a merge that has
+  # already passed `ci / passed`; the ruleset forbids any other kind.
+  #
+  # NAMED RATHER THAN `secrets: inherit`, and that is the estate's own tooling
+  # deciding rather than a preference. `inherit` was the chosen form — same
+  # organisation, same control, one line instead of three — and zizmor's
+  # `secrets-inherit` audit fails it at High confidence, which reddens the
+  # `ci / workflows` job of this very workflow. The audit is right about why:
+  # inherit passes every organisation and repository secret the caller can see,
+  # not the two the callee declares, and it GROWS SILENTLY, since a secret added
+  # to the organisation later would flow into this call with nobody editing this
+  # file. Naming the two is the fix the audit asks for, not a suppression of it.
+  main:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: yadgarhq/actions/.github/workflows/ci-pr.yaml@main
+    permissions:
+      contents: read
+    secrets:
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
