@@ -36,9 +36,51 @@
 //! `diff` level, by
 //! `tests/balance.rs::recovering_from_an_empty_set_inserts_everything`. The
 //! loop's OWN `resolved.is_empty()` guard — that an empty answer removes nothing
-//! — has no test. `mod tests` below covers the loop's exit and its bookkeeping
-//! of what the balancer was given, not the effect of that branch on the endpoint
-//! set.
+//! — has no test. `mod tests` below covers the loop's exit, its bookkeeping of
+//! what the balancer was given, and when it withdraws the lazy seed; not the
+//! effect of that branch on the endpoint set.
+//!
+//! That guard is nonetheless what makes the seed a ONE-WAY latch: an endpoint
+//! set that has been non-empty once can never return to empty, so the name is
+//! needed at most once, at boot. See `refresh`.
+//!
+//! # The boot dial
+//!
+//! **NOTHING HERE FAILS BECAUSE AN UPSTREAM IS NOT THERE YET.** Every entry
+//! point used to resolve and return the error, and three of the four internal
+//! hops in this estate dial at boot — so `gateway` exited with `could not
+//! resolve task:50052` and crash-looped six times on a rebuilt cluster, before
+//! `task`'s Service existed. It self-healed. That is the argument FOR fixing it
+//! rather than against: the cold start costs exponential backoff, and a restart
+//! count spent on an ordering accident is a restart count that no longer shows
+//! a real crash.
+//!
+//! **THE WINDOW IS THE DESIGN, not the omission.** A balanced channel with no
+//! endpoints is not one that connects later: `Balance::poll_ready` is
+//! `Poll::Pending` while its ready set is empty, and no bound in this crate
+//! sits above that — [`default_request_timeout`] lives INSIDE a connection and
+//! never sees a request that has not been given one. So "return a channel and
+//! let the loop fill it" would trade a crash loop for a process that starts
+//! happily and hangs every caller, which is worse and much harder to see.
+//!
+//! What is returned instead always holds at least one endpoint. Until an
+//! address resolves that endpoint is the NAME — `Peer::Unresolved` — which is
+//! precisely what `gateway`'s `connect_iam` does with `Endpoint::connect_lazy`,
+//! the one internal hop that never crash-looped. A request in the window is
+//! dialled at the name and comes back with the transport's own error in
+//! milliseconds; the next request retries. The refresh loop then inserts the
+//! resolved addresses and withdraws the name, in that order, so the balancer is
+//! never empty.
+//!
+//! **WHAT STILL FAILS LOUDLY, because fail-fast was the property traded away.**
+//! A CONFIGURATION mistake is still an error before a channel exists: an
+//! unreadable or rootless CA bundle, a client certificate that is not there, a
+//! host that does not form a URI authority. No resolution would ever fix any of
+//! those. And an upstream that is genuinely, permanently absent is reported by
+//! the refresh loop at ERROR on every tick, naming the host and saying that no
+//! endpoint has EVER been available — see `still_absent`. A service that starts
+//! and cannot serve is the failure mode this estate keeps finding, so it is
+//! stated rather than left to be inferred from a silence.
 //!
 //! # TLS
 //!
@@ -92,9 +134,11 @@
 //! | [`default_request_timeout`] | a peer that is alive, connected, answering pings, and never replies |
 //!
 //! **The first bounds a phase the other three never reach.** Every entry point
-//! resolves before it builds anything, so a wedged resolver held `connect` open
-//! for ever with nothing to report — and most callers here connect eagerly at
-//! boot, which makes that a process that starts and never finishes starting.
+//! still ATTEMPTS a resolution before it returns, so a wedged resolver held
+//! `connect` open for ever with nothing to report — and most callers here dial
+//! at boot, which makes that a process that starts and never finishes starting.
+//! The attempt is no longer allowed to FAIL the dial (see "The boot dial"), but
+//! it is still an await, so it still needs the bound.
 //!
 //! **The last was missing too, and nothing else covers it.** A `-db` blocked on its
 //! engine connects fine, pings fine, and holds every caller's handler open
@@ -105,7 +149,7 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -158,11 +202,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long ONE resolution may take before it is abandoned.
 ///
-/// **`connect_with` awaits a resolution before anything else exists**, and three
-/// of the four callers in this estate connect eagerly at boot. An unbounded
-/// lookup against a wedged resolver is therefore a process that starts and then
-/// never finishes starting — a silent startup hang rather than a crash loop, so
-/// no restart policy notices and nothing is logged.
+/// **IT STILL APPLIES ON THE BOOT PATH, and that is deliberate.** `connect_with`
+/// no longer DEPENDS on a resolution — a failure there is a warning and a lazy
+/// dial at the name — but it still ATTEMPTS one, because a `-db` that is already
+/// up should produce a balancer full of pod addresses before the first request,
+/// with no window at all. An awaited lookup needs a bound whether or not its
+/// failure is fatal: unbounded, a wedged resolver is a process that starts and
+/// then never finishes starting — a silent startup hang rather than a crash
+/// loop, so no restart policy notices and nothing is logged. With the bound,
+/// the worst a wedged resolver costs the boot dial is this long, after which
+/// the channel comes back dialling the name.
+///
+/// The loop applies the same bound on every tick, through the same `resolve`.
 ///
 /// **WHAT THIS DOES NOT FIX, said rather than left to be discovered.** A `String`
 /// target is resolved on the blocking pool — `spawn_blocking(getaddrinfo)`,
@@ -391,8 +442,66 @@ impl TlsOptions {
     }
 }
 
+/// Which peer an entry in the balancer is.
+///
+/// **`Unresolved` is the whole of the laziness.** A balanced channel holding no
+/// endpoints is not a channel that connects later — `Balance::poll_ready`
+/// returns `Poll::Pending` while its ready set is empty, and nothing in this
+/// crate is above that, so a request handed to one waits for ever. So the
+/// channel is never given nothing: until an address resolves it holds ONE
+/// endpoint dialling the NAME, which is exactly what `gateway`'s `connect_iam`
+/// does with `Endpoint::connect_lazy` and the reason that hop never crash-looped.
+///
+/// Every endpoint tonic puts in a balancer is a `Connection::lazy`
+/// (`tonic-0.14.6/src/transport/channel/service/discover.rs:39`), and a lazy
+/// connection whose connect fails reports itself READY and returns the failure
+/// from the request instead (`.../service/reconnect.rs`, the `is_lazy` branch).
+/// So this entry costs a fast, named error per request rather than a hang, and
+/// the next request retries the connect.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Peer {
+    /// The host NAME, dialled while no resolution has answered.
+    Unresolved,
+    /// A pod address, from a resolution that answered.
+    Address(SocketAddr),
+}
+
+/// `host` and `port` as a URI AUTHORITY, which is not the same string as
+/// `host` and `port` as a resolver target.
+///
+/// **An IPv6 LITERAL has to be bracketed, and a name must not be.**
+/// `::1:50051` is a perfectly good target — `lookup_host` splits it at its last
+/// colon — and it is not a valid authority at all, so `Endpoint::from_shared`
+/// refuses it. The distinction never arose while every endpoint was built from
+/// a resolved `SocketAddr`, whose `Display` brackets a v6 address for free. The
+/// seed is built from the HOST, so it has to do that itself, or a literal that
+/// dialled perfectly well before becomes `InvalidHost`.
+///
+/// Nothing in this estate dials a literal today: all three consumers pass a
+/// Service name out of the environment. That is a reason to get it right here
+/// rather than a reason to leave it.
+fn authority(host: &str, port: u16) -> String {
+    match host.parse::<Ipv6Addr>() {
+        Ok(literal) => format!("[{literal}]:{port}"),
+        Err(_) => format!("{host}:{port}"),
+    }
+}
+
+/// One endpoint, at `authority`.
+///
+/// **`authority` IS A STRING RATHER THAN A `SocketAddr` BECAUSE TWO DIFFERENT
+/// THINGS ARE DIALLED HERE.** The steady state is a pod address. The other is
+/// the NAME itself, dialled while no resolution has answered yet — see [`Peer`]
+/// — and a name is not a `SocketAddr`. ONE builder serves both, so the scheme,
+/// the timeouts and the keepalive cannot come to differ between the endpoint
+/// that serves the first seconds of a process's life and the ones that serve
+/// the rest of it.
+///
+/// That is also why the URI parse is an ERROR rather than the `expect` it used
+/// to be: a socket address always forms an authority, and a host out of a
+/// deployment's environment does not.
 fn endpoint(
-    addr: SocketAddr,
+    authority: &str,
     tls: Option<&ClientTlsConfig>,
     request_timeout: Duration,
 ) -> Result<Endpoint, BalanceError> {
@@ -402,8 +511,10 @@ fn endpoint(
     // configuration it never consults. So the two are decided together, here,
     // and cannot drift apart.
     let scheme = if tls.is_some() { "https" } else { "http" };
-    let endpoint = Endpoint::from_shared(format!("{scheme}://{addr}"))
-        .expect("a socket address always forms a valid authority")
+    let endpoint = Endpoint::from_shared(format!("{scheme}://{authority}"))
+        .map_err(|_| BalanceError::InvalidHost {
+            host: authority.to_string(),
+        })?
         // A dead pod must not hold a request open until the caller's deadline.
         // tonic applies this to the TCP connect alone: it is set on the inner
         // HTTP connector, while the TLS handshake runs in the layer above it. A
@@ -456,6 +567,13 @@ fn endpoint(
 /// The bound is ONE `RERESOLVE` tick rather than instant: the task is asleep when
 /// the channel is dropped, and notices when it next wakes.
 ///
+/// **THIS DOES NOT FAIL BECAUSE `host` DOES NOT RESOLVE.** A name with no
+/// Service behind it yet is an ordering accident, not a reason to take the
+/// caller's process down, and the channel returned serves requests by dialling
+/// the name until an address answers — see "The boot dial" on the crate. What
+/// still fails here is a host that cannot form a URI authority, which no
+/// resolution would fix.
+///
 /// Requests are bounded by [`default_request_timeout`]. A caller that needs its
 /// own bound uses [`connect_with_request_timeout`].
 pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
@@ -480,7 +598,9 @@ pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
 /// the response head — so a peer that sends headers and then stalls its body is
 /// not caught by it. Nor is a request that has not been handed to a connection
 /// yet because no endpoint is ready; that is the balancer's readiness, one
-/// layer up.
+/// layer up, and NOTHING in this crate bounds it. That is why the channel is
+/// never handed back with an empty endpoint set — see "The boot dial" on the
+/// crate — rather than something this bound could be stretched to cover.
 pub async fn connect_with_request_timeout(
     host: &str,
     port: u16,
@@ -500,6 +620,13 @@ pub async fn connect_with_request_timeout(
 /// decoded, contains no certificate, or yields no usable trust anchor is an error
 /// returned from here, before any channel exists. There is no path through this
 /// function that produces a cleartext channel.
+///
+/// **An absent upstream is not one of those**, on this path exactly as on
+/// [`connect`]'s: a name that does not resolve yet is dialled lazily rather than
+/// returned as an error, and the endpoint that serves the window carries this
+/// same configuration. The seam a misconfiguration could slip through is the
+/// one `endpoint` closes by deciding the scheme and the TLS configuration in a
+/// single expression, for the name and for a pod address alike.
 ///
 /// Server TLS with client-side verification is what this provides by default.
 /// Presenting a CLIENT certificate — mutual TLS — is [`TlsOptions::identity`]
@@ -533,22 +660,48 @@ async fn connect_with(
     tls: Option<ClientTlsConfig>,
     request_timeout: Duration,
 ) -> Result<Channel, BalanceError> {
-    let initial = resolve(host, port).await?;
-    if initial.is_empty() {
-        return Err(BalanceError::NoEndpoints {
-            host: host.to_string(),
-        });
-    }
-    // `tls` is recorded because "is this connection encrypted?" must be
-    // answerable from the logs of the process doing the connecting. The
-    // cut-over is a separate change from this one, and an operator has to be
-    // able to see which side of it a given pod is on.
-    tracing::info!(
-        host,
-        count = initial.len(),
-        tls = tls.is_some(),
-        "balancing across replicas"
-    );
+    // BUILT FIRST, AND UNCONDITIONALLY, for two separate reasons.
+    //
+    // It is what the channel is seeded with when nothing resolves, and it is
+    // also the only place a host that cannot be dialled AT ALL is caught. Doing
+    // it here rather than only on the empty path means an unusable name is an
+    // error on every call, not on the calls where DNS happened to fail too.
+    let seed = endpoint(&authority(host, port), tls.as_ref(), request_timeout)?;
+
+    // ATTEMPTED, NO LONGER DEPENDED ON — and the distinction is the change.
+    //
+    // The resolution still happens here and is still bounded by
+    // `RESOLVE_TIMEOUT`, because the steady state is worth keeping: a `-db` that
+    // is already up produces a balancer full of pod addresses before the first
+    // request, with no window at all. What went away is the `?`. A name that
+    // does not resolve is an upstream that is not there YET — the Service is
+    // created seconds after the Deployment that dials it — and exiting on it
+    // costs a cold start of exponential backoff and spends the restart count
+    // that would otherwise have shown a real crash.
+    let initial = match resolve(host, port).await {
+        Ok(resolved) if !resolved.is_empty() => resolved,
+        Ok(_) => {
+            tracing::warn!(
+                host,
+                port,
+                tls = tls.is_some(),
+                "the upstream resolved to no addresses at startup; dialling the name until it \
+                 does. Under D69 this is a -db whose replicas are down or failing readiness."
+            );
+            BTreeSet::new()
+        }
+        Err(e) => {
+            tracing::warn!(
+                host,
+                port,
+                tls = tls.is_some(),
+                error = %e,
+                "the upstream is not resolvable at startup; dialling the name until it is. \
+                 This is not a boot failure: the Service usually appears seconds later."
+            );
+            BTreeSet::new()
+        }
+    };
 
     // EVERY endpoint is built BEFORE the channel exists. Building them inside
     // the send loop would let a late failure return an error after earlier
@@ -558,28 +711,73 @@ async fn connect_with(
     // by the accident that nothing in `endpoint` depends on the address.
     let built = initial
         .iter()
-        .map(|addr| Ok((*addr, endpoint(*addr, tls.as_ref(), request_timeout)?)))
+        .map(|addr| {
+            Ok((
+                *addr,
+                endpoint(&addr.to_string(), tls.as_ref(), request_timeout)?,
+            ))
+        })
         .collect::<Result<Vec<_>, BalanceError>>()?;
 
-    let (channel, tx) = Channel::balance_channel::<SocketAddr>(built.len().max(8));
-    for (addr, built) in built {
-        // Before any request is served: a channel with no endpoints yet would
-        // fail the first calls while the loop caught up.
-        let _ = tx.send(Change::Insert(addr, built)).await;
+    let (channel, tx) = Channel::balance_channel::<Peer>(built.len().max(8));
+
+    // `tls` is recorded because "is this connection encrypted?" must be
+    // answerable from the logs of the process doing the connecting. The
+    // cut-over is a separate change from this one, and an operator has to be
+    // able to see which side of it a given pod is on.
+    let seeded = built.is_empty();
+    if seeded {
+        // THE CHANNEL IS NEVER GIVEN NOTHING. See `Peer` for why an empty
+        // balancer is a hang rather than a wait.
+        let _ = tx.send(Change::Insert(Peer::Unresolved, seed)).await;
+        tracing::info!(
+            host,
+            tls = tls.is_some(),
+            "dialling the name until an address resolves"
+        );
+    } else {
+        tracing::info!(
+            host,
+            count = built.len(),
+            tls = tls.is_some(),
+            "balancing across replicas"
+        );
+        for (addr, built) in built {
+            // Before any request is served: a channel with no endpoints yet
+            // would fail the first calls while the loop caught up.
+            let _ = tx.send(Change::Insert(Peer::Address(addr), built)).await;
+        }
     }
 
     tokio::spawn(refresh(
-        host.to_string(),
-        port,
+        Target {
+            host: host.to_string(),
+            port,
+            tls,
+            request_timeout,
+        },
         initial,
+        seeded,
         tx,
-        tls,
-        request_timeout,
         // The production resolver. `refresh` takes it as a parameter rather
         // than calling `resolve` itself — see there for why the seam exists.
         |host, port| async move { resolve(&host, port).await },
     ));
     Ok(channel)
+}
+
+/// What a dial IS, independent of which addresses it currently reaches.
+///
+/// A struct rather than four more arguments because the four travel together
+/// everywhere and mean nothing apart: `refresh` needs all of them on every tick
+/// to rebuild an endpoint, and a rebuild that used a different `tls` or a
+/// different `request_timeout` from the boot dial would be the silent drift
+/// this crate exists to prevent.
+struct Target {
+    host: String,
+    port: u16,
+    tls: Option<ClientTlsConfig>,
+    request_timeout: Duration,
 }
 
 /// The loop. Separate from `connect` so a failed resolution never takes down a
@@ -606,18 +804,32 @@ async fn connect_with(
 /// balancer permanently. "Given" here means handed to the discovery channel — the
 /// balancer applies it from there — so this tracks the sends that succeeded,
 /// never the resolution that prompted them.
+///
+/// **`seeded` IS A ONE-WAY LATCH, and there is an invariant behind that.** It
+/// says the balancer is holding [`Peer::Unresolved`] — the name — because boot
+/// resolved nothing. The seed has to go once real addresses are in, or traffic
+/// keeps being split between the balanced pods and whichever single pod the
+/// name happens to resolve to. It never has to come BACK, because the
+/// empty-resolution guard below forbids `current` from returning to empty once
+/// it is non-empty: an empty answer removes nothing. So the seed is needed at
+/// most once, at boot, and this is a latch rather than per-tick bookkeeping.
 async fn refresh<R, F>(
-    host: String,
-    port: u16,
+    target: Target,
     mut current: BTreeSet<SocketAddr>,
-    tx: Sender<Change<SocketAddr, Endpoint>>,
-    tls: Option<ClientTlsConfig>,
-    request_timeout: Duration,
+    mut seeded: bool,
+    tx: Sender<Change<Peer, Endpoint>>,
     resolver: R,
 ) where
     R: Fn(String, u16) -> F,
     F: Future<Output = Result<BTreeSet<SocketAddr>, BalanceError>>,
 {
+    let Target {
+        host,
+        port,
+        tls,
+        request_timeout,
+    } = target;
+
     loop {
         tokio::time::sleep(RERESOLVE).await;
 
@@ -635,7 +847,7 @@ async fn refresh<R, F>(
         let resolved = match resolver(host.clone(), port).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(host, error = %e, "re-resolution failed; keeping the current endpoints");
+                still_absent(&host, current.is_empty(), format_args!("{e}"));
                 continue;
             }
         };
@@ -645,10 +857,7 @@ async fn refresh<R, F>(
         // would take the client to zero endpoints and fail every request — a
         // self-inflicted outage from a transient DNS answer.
         if resolved.is_empty() {
-            tracing::warn!(
-                host,
-                "re-resolution returned no addresses; keeping the current set"
-            );
+            still_absent(&host, current.is_empty(), format_args!("no addresses"));
             continue;
         }
 
@@ -666,7 +875,7 @@ async fn refresh<R, F>(
                     // the endpoint in cleartext — is the exact downgrade this
                     // module exists to prevent, and it must not be reachable
                     // even by accident.
-                    let built = match endpoint(addr, tls.as_ref(), request_timeout) {
+                    let built = match endpoint(&addr.to_string(), tls.as_ref(), request_timeout) {
                         Ok(built) => built,
                         Err(e) => {
                             tracing::error!(
@@ -683,7 +892,11 @@ async fn refresh<R, F>(
                     // rather than spin against a dead sender. The check at the
                     // top of the tick does not replace this one — the receiver
                     // can be dropped part-way through a batch of changes.
-                    if tx.send(Change::Insert(addr, built)).await.is_err() {
+                    if tx
+                        .send(Change::Insert(Peer::Address(addr), built))
+                        .await
+                        .is_err()
+                    {
                         tracing::debug!(host, "channel dropped; ending re-resolution");
                         return;
                     }
@@ -691,7 +904,7 @@ async fn refresh<R, F>(
                     tracing::info!(host, %addr, "endpoint added");
                 }
                 Change::Remove(addr) => {
-                    if tx.send(Change::Remove(addr)).await.is_err() {
+                    if tx.send(Change::Remove(Peer::Address(addr))).await.is_err() {
                         tracing::debug!(host, "channel dropped; ending re-resolution");
                         return;
                     }
@@ -700,6 +913,61 @@ async fn refresh<R, F>(
                 }
             }
         }
+
+        // THE SEED GOES ONLY ONCE A RESOLVED ADDRESS HAS BEEN GIVEN, and
+        // "given" is `current` — the same distinction the rest of this loop
+        // draws, for the same reason.
+        //
+        // GATING THIS ON `!resolved.is_empty()` COMPILES, READS IDENTICALLY AND
+        // IS WRONG. A tick where DNS answers and every `endpoint` above fails
+        // to build sends nothing, so withdrawing the seed on the strength of
+        // the ANSWER would leave the balancer holding no endpoint at all — the
+        // empty-balancer hang this seed exists to prevent, reintroduced by the
+        // code that retires it.
+        //
+        // AFTER the insertions rather than before, so there is no tick on which
+        // the balancer holds nothing.
+        if seeded && !current.is_empty() {
+            if tx.send(Change::Remove(Peer::Unresolved)).await.is_err() {
+                tracing::debug!(host, "channel dropped; ending re-resolution");
+                return;
+            }
+            seeded = false;
+            tracing::info!(
+                host,
+                count = current.len(),
+                "the upstream resolved; the name is withdrawn and traffic is balanced across \
+                 replicas"
+            );
+        }
+    }
+}
+
+/// Report a tick that produced no addresses, at the level the SITUATION
+/// deserves rather than at one level for both.
+///
+/// **The two cases are different operator situations and used to share a
+/// message.** An upstream that has endpoints and blipped is a warning and
+/// nothing more: the current set is kept, and requests keep being served. An
+/// upstream that has NEVER produced an address is a service that started
+/// happily and cannot serve anything — the failure mode the boot exit used to
+/// make obvious, and the one this crate now has to state for itself, on every
+/// tick, because nothing else will.
+fn still_absent(host: &str, nothing_given_yet: bool, why: std::fmt::Arguments<'_>) {
+    if nothing_given_yet {
+        tracing::error!(
+            host,
+            reason = %why,
+            interval_secs = RERESOLVE.as_secs(),
+            "the upstream has never resolved; NO endpoint has ever been available and every \
+             request to it is failing. This is a missing or unready Service, not a slow one."
+        );
+    } else {
+        tracing::warn!(
+            host,
+            reason = %why,
+            "re-resolution produced nothing; keeping the current endpoints"
+        );
     }
 }
 
@@ -753,13 +1021,6 @@ pub const fn default_request_timeout() -> Duration {
 #[derive(Debug, thiserror::Error)]
 pub enum BalanceError {
     #[error(
-        "DNS returned no addresses for {host}. For a headless Service this means \
-         no ready endpoints — the -db replicas are down or failing readiness, \
-         which under D69 includes failing their capability probe or migrations."
-    )]
-    NoEndpoints { host: String },
-
-    #[error(
         "resolving {host} did not finish within {after:?}. This is NOT a name \
          that does not exist — that answers, and answers quickly. It is a \
          resolver that stopped answering at all, and the caller is released \
@@ -768,6 +1029,14 @@ pub enum BalanceError {
          the resolver replies."
     )]
     DnsTimedOut { host: String, after: Duration },
+
+    #[error(
+        "{host} cannot be dialled at all: it does not form a URI authority. This \
+         is NOT an upstream that is absent — no resolution will ever fix it — so \
+         it is reported before a channel exists rather than deferred to a lazy \
+         dial that could never succeed."
+    )]
+    InvalidHost { host: String },
 
     #[error("could not resolve {host}: {source}")]
     Dns {
@@ -851,6 +1120,34 @@ mod tests {
 
     use super::*;
 
+    /// The dial every case here re-resolves, with the caller's own bound rather
+    /// than a number a case could satisfy by accident.
+    fn target(tls: Option<ClientTlsConfig>) -> Target {
+        Target {
+            host: "task-db".to_string(),
+            port: 50051,
+            tls,
+            request_timeout: REQUEST_TIMEOUT,
+        }
+    }
+
+    /// Everything the balancer was handed, in order, as text.
+    ///
+    /// TEXT rather than the `Change` values themselves so a case can assert the
+    /// ORDER of two different kinds of change against one another — which is
+    /// what the seed cases are about — in an assertion that prints what went
+    /// wrong.
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<Change<Peer, Endpoint>>) -> Vec<String> {
+        let mut observed = Vec::new();
+        while let Ok(change) = rx.try_recv() {
+            observed.push(match change {
+                Change::Insert(peer, _) => format!("insert {peer:?}"),
+                Change::Remove(peer) => format!("remove {peer:?}"),
+            });
+        }
+        observed
+    }
+
     /// A resolver that never fails and always answers with `set`.
     fn always(
         set: BTreeSet<SocketAddr>,
@@ -888,15 +1185,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(60),
-            refresh(
-                "task-db".to_string(),
-                50051,
-                stable.clone(),
-                tx,
-                None,
-                REQUEST_TIMEOUT,
-                always(stable),
-            ),
+            refresh(target(None), stable.clone(), false, tx, always(stable)),
         )
         .await;
 
@@ -945,28 +1234,104 @@ mod tests {
         let _ = tokio::time::timeout(
             RERESOLVE * 2 + Duration::from_secs(1),
             refresh(
-                "task-db".to_string(),
-                50051,
+                target(Some(unbuildable)),
                 BTreeSet::new(),
+                false,
                 tx,
-                Some(unbuildable),
-                REQUEST_TIMEOUT,
                 resolver,
             ),
         )
         .await;
 
-        let mut observed = Vec::new();
-        while let Ok(change) = rx.try_recv() {
-            observed.push(match change {
-                Change::Insert(addr, _) => format!("insert {addr}"),
-                Change::Remove(addr) => format!("remove {addr}"),
-            });
-        }
+        let observed = drain(&mut rx);
         assert!(
             observed.is_empty(),
             "no endpoint could be built, so the balancer was given nothing — and a removal here \
              takes away an address it never had: {observed:?}"
+        );
+    }
+
+    /// THE SEED IS WITHDRAWN, and only once a resolved address has actually been
+    /// given to the balancer.
+    ///
+    /// Leaving it in is not harmless: the name resolves to ONE pod, so a
+    /// balancer holding both it and every pod address sends a share of the
+    /// traffic down an unbalanced path for the life of the process — D23's
+    /// failure, reintroduced by the thing that fixed the boot.
+    ///
+    /// THE ORDER IS THE OTHER HALF. The insertion goes first, so there is no
+    /// moment at which the balancer holds nothing and `poll_ready` is
+    /// `Pending`. Reverse the two statements and this case says so.
+    #[tokio::test(start_paused = true)]
+    async fn the_seed_is_withdrawn_after_a_resolved_address_is_given() {
+        let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+        let resolved = BTreeSet::from([addr]);
+
+        // ALIVE across the tick: dropping it ends the loop before the tick that
+        // matters.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let _ = tokio::time::timeout(
+            RERESOLVE + Duration::from_secs(1),
+            refresh(
+                target(None),
+                // Nothing was given at boot, and the seed is in the balancer.
+                BTreeSet::new(),
+                true,
+                tx,
+                always(resolved),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                "insert Address(10.0.0.1:50051)".to_string(),
+                "remove Unresolved".to_string(),
+            ],
+            "the resolved address must be in before the name goes out, and the name must go"
+        );
+    }
+
+    /// AND IT SURVIVES A TICK THAT COULD BUILD NOTHING.
+    ///
+    /// **This is the case that separates "what was given" from "what was
+    /// resolved" for the seed**, exactly as
+    /// `an_endpoint_that_fails_to_build_is_not_recorded_as_given` does for
+    /// `current`. DNS answers here, so a withdrawal gated on `resolved` fires —
+    /// and every `endpoint` build fails, so nothing replaces the seed. The
+    /// balancer would be left holding NOTHING, which is the empty-balancer hang
+    /// the seed exists to prevent.
+    ///
+    /// Change the gate to `!resolved.is_empty()` and this fails.
+    #[tokio::test(start_paused = true)]
+    async fn the_seed_survives_a_tick_that_could_build_nothing() {
+        let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        // Nothing can be built with this: every `endpoint` call fails before any
+        // send. The same lever `a_host_that_is_not_a_valid_server_name_is_refused`
+        // pulls.
+        let unbuildable = ClientTlsConfig::new().domain_name("not a server name");
+
+        let _ = tokio::time::timeout(
+            RERESOLVE * 2 + Duration::from_secs(1),
+            refresh(
+                target(Some(unbuildable)),
+                BTreeSet::new(),
+                true,
+                tx,
+                always(BTreeSet::from([addr])),
+            ),
+        )
+        .await;
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no endpoint could be built, so the name is still the only thing that can serve a \
+             request — withdrawing it leaves the balancer empty, and an empty balancer never \
+             becomes ready"
         );
     }
 
@@ -1004,16 +1369,38 @@ mod tests {
     fn the_scheme_follows_the_tls_configuration() {
         let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
 
-        let cleartext = endpoint(addr, None, REQUEST_TIMEOUT).unwrap();
+        let cleartext = endpoint(&addr.to_string(), None, REQUEST_TIMEOUT).unwrap();
         assert_eq!(cleartext.uri().scheme_str(), Some("http"));
 
         let secured = endpoint(
-            addr,
+            &addr.to_string(),
             Some(&ClientTlsConfig::new().domain_name("task-db")),
             REQUEST_TIMEOUT,
         )
         .expect("a TLS endpoint with a valid domain builds");
         assert_eq!(secured.uri().scheme_str(), Some("https"));
+    }
+
+    /// AN IPv6 LITERAL IS A VALID HOST AND NOT A VALID AUTHORITY.
+    ///
+    /// This never mattered while every endpoint was built from a resolved
+    /// `SocketAddr`, because `SocketAddr`'s `Display` brackets a v6 address.
+    /// The seed is built from the host instead, so dropping the bracketing here
+    /// turns `connect("::1", …)` — which worked — into `InvalidHost`, and turns
+    /// it BEFORE the resolution that would have succeeded.
+    #[test]
+    fn an_ipv6_literal_host_is_bracketed_and_a_name_is_not() {
+        assert_eq!(authority("::1", 50051), "[::1]:50051");
+        assert_eq!(authority("task-db", 50051), "task-db:50051");
+        assert_eq!(authority("10.0.0.1", 50051), "10.0.0.1:50051");
+
+        // And what the bracketing buys: unbracketed, this is `InvalidHost`.
+        let built = endpoint(&authority("::1", 50051), None, REQUEST_TIMEOUT)
+            .expect("an IPv6 literal must still be dialable");
+        assert_eq!(
+            built.uri().authority().map(|a| a.as_str()),
+            Some("[::1]:50051")
+        );
     }
 
     /// A host that is not a name TLS can verify has to be refused. `ServerName`
@@ -1024,7 +1411,7 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
         let tls = ClientTlsConfig::new().domain_name("not a server name");
         assert!(matches!(
-            endpoint(addr, Some(&tls), REQUEST_TIMEOUT),
+            endpoint(&addr.to_string(), Some(&tls), REQUEST_TIMEOUT),
             Err(BalanceError::Tls { .. })
         ));
     }
