@@ -10,6 +10,35 @@ description = "How a service reaches another service: client-side gRPC balancing
 # Only what dialling needs. No proto, no telemetry, no store — a crate every
 # service links should pull in as little as possible, because its dependency tree
 # becomes theirs.
+#
+# `metrics` IS THE ONE EXCEPTION, AND IT IS AN EXCEPTION RATHER THAN A DRIFT.
+# The rule above is about weight, so the weight was MEASURED with
+# `cargo tree -e normal` rather than assumed: 66 crates before, 69 after — this
+# facade, `rapidhash`, and `rustversion` as a proc-macro. Nothing else moves.
+#
+# What it buys is the signal v0.2.0 removed. Making the boot dial lazy was
+# right, and it traded away the only thing that ever said an upstream was
+# missing: a service whose upstream is absent used to crash-loop, which showed
+# up as CrashLoopBackOff, a climbing restart count, a Deployment at 0/2 and a
+# Degraded Argo application. It now reports `1/1 Running` with zero restarts,
+# and NOTHING in Kubernetes says anything is wrong. The ERROR line `still_absent`
+# emits was offered as the replacement and is not one: the `observability`
+# namespace runs a Prometheus server and NO log shipper — verified 2026-09-04,
+# `deploy/infra/` contains no promtail, loki, fluent-bit or vector — so that line
+# reaches `kubectl logs` and nowhere else, which is to say it reaches an operator
+# who already suspects the problem.
+#
+# THE FACADE ONLY, for the reason `yadgar-telemetry` and `yadgar-lifecycle` both
+# state: a library that installs an exporter decides the backend for every
+# service that links it. The binary installs one.
+#
+# NOT BEHIND A FEATURE, deliberately, and there are two arguments. A signal that
+# can be compiled out has a default state of absent, which is the condition
+# being fixed. And this crate declares no features today, so the shared CI skips
+# `cargo test --no-default-features` entirely — its predicate reads
+# `cargo metadata` — and adding one would newly activate that step. That is cost
+# spent to buy the ability to remove a signal.
+metrics = "0.24"
 tonic = { version = "0.14", default-features = false, features = [
   "codegen",
   "transport",
@@ -60,6 +89,15 @@ tonic = { version = "0.14", default-features = false, features = ["router"] }
 # the repository is a secret in the repository, and it expires.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+# `DebuggingRecorder` + `with_local_recorder`: the only way to assert that the
+# metric NAME a dashboard queries, the LABEL an alert groups by, and the value
+# the gauge receives are what this crate claims.
+#
+# MUST resolve against `metrics 0.24`, and this is not a version-hygiene note —
+# a `metrics-util` built on another major links a SECOND facade, and then the
+# snapshot comes back EMPTY while every assertion still compiles and passes.
+# Which is why every case below asserts the snapshot's LENGTH before reading it.
+metrics-util = { version = "0.20", features = ["debugging"] }
 
 [lints.rust]
 unsafe_code = "forbid"

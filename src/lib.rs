@@ -82,6 +82,28 @@
 //! and cannot serve is the failure mode this estate keeps finding, so it is
 //! stated rather than left to be inferred from a silence.
 //!
+//! **AND STATED AS A METRIC, BECAUSE THE LOG LINE ABOVE REACHES NOBODY.** That
+//! ERROR was offered as the replacement for the crash loop and cannot be one:
+//! the `observability` namespace runs a Prometheus server and NO log shipper,
+//! so the line reaches `kubectl logs` and nowhere else — which is to say it
+//! reaches an operator who has already guessed the answer. Meanwhile the pod
+//! reads `1/1 Running`, zero restarts, Argo Healthy. So the same condition is
+//! also published as [`UPSTREAM_NEVER_RESOLVED`], a gauge keyed by upstream,
+//! and READ THAT ITEM'S DOCS BEFORE ALERTING ON IT: the predicate is narrower
+//! than the name.
+//!
+//! **A METRIC IS A CAPABILITY AND NOT YET A SIGNAL, and pretending otherwise
+//! would repeat the mistake this paragraph is correcting.** Nothing alerts on
+//! it today. Verified 2026-09-04 in `yadgarhq/deploy`: no `PrometheusRule`
+//! exists anywhere, no Prometheus Operator is installed — no
+//! `monitoring.coreos.com` CRD, no `ServiceMonitor` — so that resource is not
+//! even reconcilable, and `infra/prometheus.yaml` sets `alertmanager.enabled:
+//! false`, so there is nothing to route a firing rule to. The rule this gauge
+//! is SHAPED for is `max_over_time(yadgar_dial_upstream_never_resolved[5m]) >
+//! 0`, `for: 2m`, grouped by `upstream`. Landing it means a rules file on the
+//! Prometheus chart and an Alertmanager to receive it, both in `deploy`, and
+//! both a separate change from this one.
+//!
 //! # TLS
 //!
 //! [`connect`] dials in CLEARTEXT and always has. On a single-node cluster that
@@ -161,6 +183,83 @@ use tokio::sync::mpsc::Sender;
 // tower version, and the error reads "expected Change, found a different Change".
 use tonic::transport::channel::Change;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+
+/// The gauge saying that this process is dialling an upstream it has NEVER had
+/// an address for.
+///
+/// **THIS EXISTS BECAUSE MAKING THE BOOT DIAL LAZY REMOVED A SIGNAL AND PUT
+/// NOTHING BACK.** Before v0.2.0 an absent upstream was a crash loop, which
+/// Kubernetes reported for free — `CrashLoopBackOff`, a climbing restart count,
+/// a Deployment at 0/2, a Degraded Argo application. After it, the same pod is
+/// `1/1 Running` with zero restarts and nothing in the cluster says anything is
+/// wrong. The change was right and its CLIENT-side half was paid for; this is
+/// the operator's half.
+///
+/// # Read the predicate before alerting on it
+///
+/// It is `1` when BOTH of these hold, and `0` otherwise:
+///
+/// 1. this process still has a live dial to `upstream`, and
+/// 2. no address for it has EVER been given to the balancer.
+///
+/// **It is therefore NOT "the upstream is unreachable now", and an alert author
+/// who assumes otherwise is wrong in the quiet direction.** `refresh`'s
+/// `current` is a one-way latch — an empty resolution removes nothing, so a set
+/// that has been non-empty once can never return to empty — which means this
+/// gauge answers "has this upstream EVER resolved since boot", and falls to `0`
+/// for good at the first address. An upstream that resolves at boot and then
+/// vanishes entirely reads `0` here, exactly as a healthy one does. That is the
+/// right scope, because the failure being restored is the BOOT-ORDERING one the
+/// lazy dial introduced. It is a narrower claim than the name alone suggests,
+/// which is why the name is not the documentation.
+///
+/// The second conjunct is what makes the exit path honest. Once the channel is
+/// dropped nothing in this process dials `upstream` any more, so the condition
+/// stops holding and the gauge is set to `0` rather than left standing at `1`
+/// for the life of a pod that has moved on.
+///
+/// # `upstream` is a label, and `lifecycle` refused the analogous one
+///
+/// `yadgar-lifecycle`'s `WATCHED_FILES_UNREADABLE` is a COUNT with no per-path
+/// label, and its own doc says a path label "would make the cardinality of this
+/// metric a property of a deployment's configuration, which D67 refuses". A
+/// reviewer holding both open should see the discriminator rather than a
+/// contradiction:
+///
+/// - The range here is the set of upstreams ONE PROCESS DIALS — one or two in
+///   this estate: `gateway` reaching `iam` and `task`, `task` reaching
+///   `task-db`. A watch set grows with every file a deployment adds; a dial set
+///   is fixed by the call graph, and a new one is a code change.
+/// - The value is a service DNS name, the same class of string as the `service`
+///   label `lifecycle` already puts on that very gauge.
+/// - Without it an alert cannot NAME the absent upstream, and a page saying
+///   only "something did not resolve" sends the operator back to `kubectl logs`
+///   — the legibility this whole change exists to restore.
+///
+/// There is no second label. This crate is a library dialling outward and has
+/// no service identity of its own; the scrape supplies the pod and the job.
+///
+/// **A NAME IS AN INTERFACE TO A DASHBOARD.** Renaming it blanks a panel rather
+/// than failing anything, so it is a constant and a test asserts its spelling.
+pub const UPSTREAM_NEVER_RESOLVED: &str = "yadgar_dial_upstream_never_resolved";
+
+/// Which upstream a [`UPSTREAM_NEVER_RESOLVED`] series is about. A constant for
+/// the same reason the metric name is one: an alert groups by it.
+pub const UPSTREAM_LABEL: &str = "upstream";
+
+/// Write [`UPSTREAM_NEVER_RESOLVED`] for one upstream.
+///
+/// **EVERY PATH THAT CAN CHANGE THE ANSWER CALLS THIS, THE HEALTHY ONES
+/// INCLUDED, and that is the part it is easy to leave out.** A gauge written
+/// only when something is wrong does not exist on a healthy pod, and a series
+/// that does not exist cannot be compared against zero: `> 0` matches nothing,
+/// and "healthy" becomes indistinguishable from "this crate was never linked"
+/// and from "the process died before its first tick". So the boot dial
+/// publishes it both ways, before any tick has run.
+fn report_never_resolved(host: &str, never_resolved: bool) {
+    metrics::gauge!(UPSTREAM_NEVER_RESOLVED, UPSTREAM_LABEL => host.to_string())
+        .set(if never_resolved { 1.0 } else { 0.0 });
+}
 
 /// How often the endpoint set is re-resolved.
 ///
@@ -726,6 +825,12 @@ async fn connect_with(
     // cut-over is a separate change from this one, and an operator has to be
     // able to see which side of it a given pod is on.
     let seeded = built.is_empty();
+    // BEFORE THE FIRST TICK, AND BOTH WAYS. The window this reports opens here
+    // and the refresh loop's first tick is `RERESOLVE` away, so a gauge first
+    // written there is silent for the five seconds that matter most — and a
+    // gauge written only on the unhealthy path never exists on a healthy pod,
+    // which makes `> 0` unable to tell health from an unlinked crate.
+    report_never_resolved(host, seeded);
     if seeded {
         // THE CHANNEL IS NEVER GIVEN NOTHING. See `Peer` for why an empty
         // balancer is a hang rather than a wait.
@@ -815,6 +920,30 @@ struct Target {
 /// most once, at boot, and this is a latch rather than per-tick bookkeeping.
 async fn refresh<R, F>(
     target: Target,
+    current: BTreeSet<SocketAddr>,
+    seeded: bool,
+    tx: Sender<Change<Peer, Endpoint>>,
+    resolver: R,
+) where
+    R: Fn(String, u16) -> F,
+    F: Future<Output = Result<BTreeSet<SocketAddr>, BalanceError>>,
+{
+    let host = target.host.clone();
+    re_resolve(target, current, seeded, tx, resolver).await;
+
+    // THE ONE EXIT, AND IT IS A WRAPPER FOR THAT REASON. `re_resolve` returns
+    // from five places, and a gauge left standing at 1 by the one that got
+    // missed alerts for the life of the pod about an upstream this process
+    // stopped dialling. The condition `UPSTREAM_NEVER_RESOLVED` names has two
+    // conjuncts, and the first of them — that a live dial exists — is false
+    // from here on however the loop ended.
+    report_never_resolved(&host, false);
+}
+
+/// The loop itself. See [`refresh`] for why it is wrapped rather than being the
+/// whole of it.
+async fn re_resolve<R, F>(
+    target: Target,
     mut current: BTreeSet<SocketAddr>,
     mut seeded: bool,
     tx: Sender<Change<Peer, Endpoint>>,
@@ -843,6 +972,20 @@ async fn refresh<R, F>(
             tracing::debug!(host, "channel dropped; ending re-resolution");
             return;
         }
+
+        // ONE WRITE COVERING EVERY TICK THAT CHANGES NOTHING, and there are
+        // three of them: a resolver error, an empty answer, and an unchanged
+        // set. Each `continue`s, so a write placed at the bottom of the loop
+        // would miss all three — and the first two are precisely the ticks a
+        // never-resolved upstream produces for ever.
+        //
+        // `current.is_empty()` IS the predicate rather than a proxy for it: the
+        // empty-resolution guard below forbids `current` from returning to
+        // empty once it is non-empty, so an empty `current` means no address
+        // has EVER been given. It is the same value `still_absent` splits its
+        // ERROR from its WARN on, read at the same point, which is what keeps
+        // the log line and the gauge from ever disagreeing.
+        report_never_resolved(&host, current.is_empty());
 
         let resolved = match resolver(host.clone(), port).await {
             Ok(r) => r,
@@ -940,6 +1083,13 @@ async fn refresh<R, F>(
                  replicas"
             );
         }
+
+        // AND AGAIN, BECAUSE THIS IS THE ONLY PATH THAT CHANGED `current`.
+        // The write at the top of the tick read the set as it was on ENTRY, so
+        // without this one the tick that finally resolved an upstream would go
+        // on reporting the absence for another `RERESOLVE`. Every other path
+        // out of this tick left `current` alone and needs no second write.
+        report_never_resolved(&host, current.is_empty());
     }
 }
 
@@ -1118,6 +1268,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
     use super::*;
 
     /// The dial every case here re-resolves, with the caller's own bound rather
@@ -1154,6 +1306,282 @@ mod tests {
     ) -> impl Fn(String, u16) -> std::future::Ready<Result<BTreeSet<SocketAddr>, BalanceError>>
     {
         move |_host, _port| std::future::ready(Ok(set.clone()))
+    }
+
+    /// A resolver that never answers with an address, the way an upstream whose
+    /// Service does not exist yet does not.
+    fn never(
+    ) -> impl Fn(String, u16) -> std::future::Ready<Result<BTreeSet<SocketAddr>, BalanceError>>
+    {
+        |host, _port| {
+            std::future::ready(Err(BalanceError::DnsTimedOut {
+                host,
+                after: RESOLVE_TIMEOUT,
+            }))
+        }
+    }
+
+    /// One metric, flattened to the three things an alert actually reads.
+    type Emitted = (String, Vec<(String, String)>, f64);
+
+    /// Drive `body` to completion with a recorder installed for the WHOLE run,
+    /// and return every metric it emitted.
+    ///
+    /// **A RUNTIME BUILT BY HAND RATHER THAN `#[tokio::test]`, AND THAT IS
+    /// FORCED RATHER THAN A PREFERENCE.** `metrics::with_local_recorder`
+    /// installs a THREAD-LOCAL and takes a SYNC closure, so a recorder
+    /// installed inside an `async` test body would cover only the statements
+    /// between two awaits — and every emission here happens after an await.
+    /// Wrapping `block_on` instead puts every poll of the future inside the
+    /// closure. The clock is paused for the same reason every other case here
+    /// pauses it: `refresh` sleeps `RERESOLVE` between ticks.
+    ///
+    /// **A NON-GAUGE PANICS HERE**, which is where the "it is a gauge" half of
+    /// each assertion below lives. A counter would satisfy every value
+    /// comparison in these cases and mean something entirely different to a
+    /// dashboard.
+    fn recorded<Fut>(body: impl FnOnce() -> Fut) -> Vec<Emitted>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter: Snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .expect("a current-thread runtime")
+                .block_on(body());
+        });
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _unit, _description, value)| {
+                let key = composite.key();
+                (
+                    key.name().to_string(),
+                    key.labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect(),
+                    match value {
+                        DebugValue::Gauge(v) => v.into_inner(),
+                        other => panic!("expected a gauge, got {other:?}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The ONE series these cases expect, asserted whole.
+    ///
+    /// **THE LENGTH ASSERTION IS NOT PEDANTRY.** A `metrics-util` resolved
+    /// against another `metrics` major links a SECOND facade: everything
+    /// compiles, nothing is captured, and an assertion phrased as "no series is
+    /// above zero" would pass against the empty snapshot — which is exactly the
+    /// mutant that has to die. Every case here asserts PRESENCE and VALUE.
+    fn only_series(emitted: &[Emitted], host: &str) -> f64 {
+        assert_eq!(
+            emitted.len(),
+            1,
+            "exactly one series is expected — an empty snapshot means a duplicate `metrics` \
+             crate, and more than one means an unintended emission: {emitted:?}"
+        );
+        let (name, labels, value) = &emitted[0];
+        assert_eq!(
+            name, UPSTREAM_NEVER_RESOLVED,
+            "the name is what a dashboard queries and an alert names"
+        );
+        assert_eq!(
+            labels,
+            &vec![(UPSTREAM_LABEL.to_string(), host.to_string())],
+            "the upstream and NOTHING else: a resolver error string is unbounded and D67 \
+             refuses it as a label"
+        );
+        *value
+    }
+
+    /// THE SPELLING, PINNED AGAINST A LITERAL RATHER THAN AGAINST ITSELF.
+    ///
+    /// **THIS CASE EXISTS BECAUSE THE OBVIOUS FORM OF IT DOES NOT WORK, AND
+    /// THAT WAS MEASURED RATHER THAN REASONED.** Every case below asserts
+    /// `name == UPSTREAM_NEVER_RESOLVED`, which reads like a check on the
+    /// spelling and is not one: renaming the constant renames BOTH sides, so
+    /// the mutant that renames the metric to `yadgar_dial_upstream_unresolved`
+    /// passed all fourteen of them. A rename is the one change to a metric that
+    /// cannot fail loudly — it blanks a panel and silences an alert while every
+    /// consumer of this crate goes on compiling — so the assertion that catches
+    /// it has to name the string a dashboard actually queries.
+    ///
+    /// `yadgar-lifecycle`'s `WATCHED_FILES_UNREADABLE` carries the same "a test
+    /// asserts its spelling" claim and the same self-referential assertion, so
+    /// the same mutant survives there.
+    #[test]
+    fn the_names_a_dashboard_queries_are_pinned_to_their_spelling() {
+        assert_eq!(
+            UPSTREAM_NEVER_RESOLVED,
+            "yadgar_dial_upstream_never_resolved"
+        );
+        assert_eq!(UPSTREAM_LABEL, "upstream");
+    }
+
+    /// THE BOOT DIAL PUBLISHES THE ABSENCE IT CREATES, and it must, because the
+    /// window this metric describes opens at boot and the first tick is
+    /// `RERESOLVE` away.
+    ///
+    /// `.invalid` is reserved by RFC 6761 and guaranteed never to resolve, so
+    /// this needs no rig. A host with no resolver at all reaches the same
+    /// branch by a different error, which makes the case robust on a sandboxed
+    /// runner rather than dependent on one.
+    #[test]
+    fn the_boot_dial_publishes_the_absence_it_creates() {
+        let host = "an-upstream-that-is-not-there-4b71.invalid";
+        let emitted = recorded(|| async move {
+            let _channel = connect_with(host, 50051, None, REQUEST_TIMEOUT)
+                .await
+                .expect("an unresolvable upstream is not a boot failure");
+        });
+
+        assert_eq!(
+            only_series(&emitted, host),
+            1.0,
+            "the pod is Running with zero restarts and cannot serve; this gauge is the only \
+             thing that says so"
+        );
+    }
+
+    /// AND A HEALTHY BOOT PUBLISHES THE ZERO.
+    ///
+    /// **This is the half that is easy to skip and cannot be.** A gauge written
+    /// only when something is wrong does not exist on a healthy pod, and `> 0`
+    /// matches nothing on a series that does not exist — so "healthy" would be
+    /// indistinguishable from "this crate was never linked" and from "the
+    /// process died before its first tick".
+    ///
+    /// An ADDRESS LITERAL rather than a name: tokio resolves it by parsing,
+    /// with no resolver involved, so this case cannot fail on a runner with no
+    /// DNS.
+    #[test]
+    fn a_boot_dial_that_resolves_publishes_the_zero() {
+        let host = "127.0.0.1";
+        let emitted = recorded(|| async move {
+            let _channel = connect_with(host, 50051, None, REQUEST_TIMEOUT)
+                .await
+                .expect("an address literal resolves to itself");
+        });
+
+        assert_eq!(only_series(&emitted, host), 0.0);
+    }
+
+    /// AN UPSTREAM THAT HAS NEVER RESOLVED KEEPS SAYING SO, on every tick.
+    ///
+    /// This is the standing condition an alert fires on. `still_absent` already
+    /// logs it at ERROR, and that line reaches `kubectl logs` and nowhere else:
+    /// no log shipper runs in this estate.
+    #[test]
+    fn an_upstream_that_never_resolves_is_reported_on_every_tick() {
+        let emitted = recorded(|| async {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let _ = tokio::time::timeout(
+                RERESOLVE * 2 + Duration::from_secs(1),
+                refresh(target(None), BTreeSet::new(), true, tx, never()),
+            )
+            .await;
+        });
+
+        assert_eq!(only_series(&emitted, "task-db"), 1.0);
+    }
+
+    /// A BLIP ON AN UPSTREAM THAT HAS RESOLVED IS NOT THE SAME CONDITION, and
+    /// the gauge has to draw the line `still_absent` already draws between WARN
+    /// and ERROR.
+    ///
+    /// **Without this case the obvious wrong implementation passes**: set the
+    /// gauge to 1 whenever a tick produces no addresses. That reports every
+    /// transient DNS answer during a rolling update as an upstream that never
+    /// came up, and an alert nobody can trust is worse than no alert.
+    #[test]
+    fn a_blip_on_an_upstream_that_has_resolved_is_not_an_absence() {
+        let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+        let emitted = recorded(move || async move {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let _ = tokio::time::timeout(
+                RERESOLVE * 2 + Duration::from_secs(1),
+                // The balancer HAS been given an address; DNS is now failing.
+                refresh(target(None), BTreeSet::from([addr]), false, tx, never()),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            only_series(&emitted, "task-db"),
+            0.0,
+            "the endpoints are kept and requests are still served — this is a warning, not the \
+             condition this gauge names"
+        );
+    }
+
+    /// THE GAUGE CLEARS ON THE TICK THAT FIRST RESOLVES, not on the one after
+    /// it.
+    ///
+    /// **This is the case that makes the second emission load-bearing.** A tick
+    /// reads `current` on entry, so an implementation that writes the gauge only
+    /// at the top of the tick reports the absence for one more `RERESOLVE` after
+    /// the upstream came up. Delete the write that follows the insertions and
+    /// this case sees 1.0.
+    #[test]
+    fn the_gauge_clears_on_the_tick_that_first_resolves() {
+        let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+        let emitted = recorded(move || async move {
+            // ALIVE across the tick: dropping it ends the loop before the tick
+            // that matters.
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let _ = tokio::time::timeout(
+                RERESOLVE + Duration::from_secs(1),
+                refresh(
+                    target(None),
+                    BTreeSet::new(),
+                    true,
+                    tx,
+                    always(BTreeSet::from([addr])),
+                ),
+            )
+            .await;
+        });
+
+        assert_eq!(only_series(&emitted, "task-db"), 0.0);
+    }
+
+    /// A DIAL NOBODY HOLDS ANY MORE IS NOT AN ABSENCE, and this is the leak the
+    /// second half of the predicate exists for.
+    ///
+    /// A gauge left standing at 1 when the loop ends alerts for the life of the
+    /// pod about an upstream the process has stopped dialling — a page with
+    /// nothing behind it, which is how an alert gets muted and then ignored.
+    /// The condition is "this process is dialling `upstream` AND has never had
+    /// an address for it", and the first conjunct stops holding here.
+    #[test]
+    fn a_dial_nobody_holds_any_more_is_no_longer_an_absence() {
+        let emitted = recorded(|| async {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            // The channel `connect` would have returned, and the caller is done
+            // with it.
+            drop(rx);
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(60),
+                // Never resolved, and the seed is in the balancer: the state
+                // this gauge reports as 1 right up to the moment the loop ends.
+                refresh(target(None), BTreeSet::new(), true, tx, never()),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "the loop must end when the channel is dropped"
+            );
+        });
+
+        assert_eq!(only_series(&emitted, "task-db"), 0.0);
     }
 
     /// THE LEAK. A stable endpoint set, and a receiver nobody holds any more.
