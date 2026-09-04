@@ -127,10 +127,43 @@ on the wait for the response to begin; and a request that has not been handed to
 a connection yet because no endpoint is ready, which is the balancer's readiness
 one layer up.
 
+## What it tells an operator
+
+One metric: `yadgar_dial_upstream_never_resolved`, a gauge labelled `upstream`.
+
+It is `1` while this process holds a live dial to that upstream and has never
+been given an address for it, and `0` otherwise. **It is not "the upstream is
+down now."** The endpoint set is a one-way latch, so the gauge answers "has this
+ever resolved since boot" and falls to `0` for good at the first address — which
+is the right scope, because the failure it restores visibility to is the
+boot-ordering one that making the dial lazy introduced. An upstream that
+resolves at boot and then disappears reads `0` here.
+
+It exists because v0.2.0 removed a signal without replacing it. An absent
+upstream used to be a crash loop, which Kubernetes reported for free:
+`CrashLoopBackOff`, a climbing restart count, a Deployment at 0/2, a Degraded
+Argo application. Afterwards the same pod is `1/1 Running` with zero restarts
+and nothing in the cluster says anything is wrong. The ERROR line the refresh
+loop emits was offered as the replacement and is not one — the `observability`
+namespace runs a Prometheus server and no log shipper, so it reaches
+`kubectl logs` and nowhere else.
+
+**Nothing alerts on it yet, and calling this an alert would repeat the mistake
+it corrects.** There is no `PrometheusRule` in the estate, no Prometheus
+Operator to reconcile one, and `alertmanager` is explicitly disabled in
+`deploy/infra/prometheus.yaml`. The rule this gauge is shaped for is
+`max_over_time(yadgar_dial_upstream_never_resolved[5m]) > 0`, `for: 2m`, grouped
+by `upstream`. Landing it is a change to `deploy`, not to this crate.
+
+The crate emits through the `metrics` facade and installs no exporter; the
+binary decides the backend.
+
 ## Dependencies
 
-Deliberately minimal: `tonic`, `tokio`, `tracing`, and `rustls-pki-types` to
-check the CA bundle with the same parser `tonic` will use on it. A crate every
+Deliberately minimal: `tonic`, `tokio`, `tracing`, `rustls-pki-types` to
+check the CA bundle with the same parser `tonic` will use on it, and the
+`metrics` facade for the gauge above — measured at three added crates on the
+normal graph, 66 to 69. A crate every
 service links makes its dependency tree everyone's. TLS uses `tls-ring` rather
 than `tls-aws-lc`: every service that links this crate builds for
 `x86_64-unknown-linux-musl` (D63), and `aws-lc-rs` wants cmake and a C toolchain
