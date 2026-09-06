@@ -14,8 +14,11 @@
 //! separately, so anything only one of them uses looks unused to the other.
 #![allow(dead_code)]
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -117,18 +120,56 @@ pub fn pki(san: &str) -> Pki {
 /// which is the only shape `TlsOptions` accepts, and the reason it accepts it.
 pub struct TempPem(PathBuf);
 
+/// One reading of the clock per PROCESS, so two runs that the OS gave the same
+/// recycled pid do not name the same files. It varies per run and never within
+/// one, which is what leaves [`unique_name`] with exactly one varying part.
+fn run_id() -> u128 {
+    static RUN: OnceLock<u128> = OnceLock::new();
+    *RUN.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    })
+}
+
+/// The name of one temporary PEM, unique within this process by CONSTRUCTION.
+///
+/// **THE CLOCK IS NOT A UNIQUENESS SOURCE ACROSS THREADS, and this is measured
+/// on this tree rather than assumed.** The name used to be `pid` plus a fresh
+/// nanosecond reading. Every test in one binary shares the pid and they run on
+/// threads, so two concurrent calls collide whenever both readings land on the
+/// same nanosecond — and then one `TempPem`'s `Drop` deletes a path a sibling
+/// test is still reading. A clock is a timestamp, not a nonce (ledger 629).
+///
+/// The counter is the ONLY part that varies within a run, which is what makes
+/// the property assertable rather than merely likely. It is asserted in
+/// `tests/tls.rs` rather than here: a `#[test]` in this module would be
+/// compiled into all three integration binaries and run three times.
+pub fn unique_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "yadgar-dial-{}-{}-{}.pem",
+        std::process::id(),
+        run_id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 impl TempPem {
     pub fn with(contents: &str) -> Self {
-        let name = format!(
-            "yadgar-dial-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(name);
-        std::fs::write(&path, contents).unwrap();
+        let path = std::env::temp_dir().join(unique_name());
+        // `create_new`, not `fs::write`. Silence is what made the old collision
+        // expensive: two tests shared a path, one deleted it, and the other
+        // failed somewhere else entirely — as a missing bundle, or as a key file
+        // that had been overwritten with a certificate. If a name is ever
+        // reused, this panics and names the file instead.
+        let mut file = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("{} already exists or cannot be made: {e}", path.display()));
+        file.write_all(contents.as_bytes()).unwrap();
         Self(path)
     }
 
