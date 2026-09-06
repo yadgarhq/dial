@@ -22,7 +22,7 @@ repos:
   # at first install and never re-resolves it, so a moving tag would silently
   # freeze each machine at whatever it meant the day it first ran.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.13.1
+    rev: v1.15.0
     hooks:
       - id: gitleaks
       - id: prettier
@@ -45,3 +45,12 @@ repos:
       - id: cargo-deny
       - id: observe-coverage
       - id: helm-lint
+      # ADR-0569's gate (ledger 648), published in v1.15.0. This repository
+      # never carried the byte-identical local copy the five service
+      # repositories did, so this is a plain new-id adoption.
+      - id: no-compiled-in-defaults
+      # LEDGER 658. Adopted though it checks nothing today: the largest `run:`
+      # block outside yadgarhq/actions is 303 bytes against an 8000-byte limit,
+      # and this repository measures 0. It is a tripwire for a block someone
+      # writes later, not a fix for anything present now.
+      - id: run-block-size
