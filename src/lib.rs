@@ -1188,7 +1188,7 @@ pub enum BalanceError {
     )]
     InvalidHost { host: String },
 
-    #[error("could not resolve {host}: {source}")]
+    #[error("could not resolve {host}")]
     Dns {
         host: String,
         #[source]
@@ -1196,9 +1196,9 @@ pub enum BalanceError {
     },
 
     #[error(
-        "could not read the CA certificate bundle at {path}: {source}. TLS was \
-         requested, so this is an error rather than a reason to connect in \
-         cleartext."
+        "TLS was requested, so a CA certificate bundle that cannot be read is \
+         an error rather than a reason to connect in cleartext. The bundle at \
+         {path} could not be read"
     )]
     CaUnreadable {
         path: PathBuf,
@@ -1206,7 +1206,7 @@ pub enum BalanceError {
         source: std::io::Error,
     },
 
-    #[error("could not decode the CA certificate bundle at {path}: {source}")]
+    #[error("could not decode the CA certificate bundle at {path}")]
     CaUnparsable {
         path: PathBuf,
         #[source]
@@ -1235,9 +1235,9 @@ pub enum BalanceError {
     CaNoTrustAnchor { path: PathBuf, sections: usize },
 
     #[error(
-        "could not read the client certificate at {path}: {source}. A client \
-         certificate was configured, so this is an error rather than a reason \
-         to connect without presenting one."
+        "a client certificate was configured, so one that cannot be read is an \
+         error rather than a reason to connect without presenting one. The \
+         certificate at {path} could not be read"
     )]
     ClientCertificateUnreadable {
         path: PathBuf,
@@ -1246,9 +1246,9 @@ pub enum BalanceError {
     },
 
     #[error(
-        "could not read the client private key at {path}: {source}. A client \
-         certificate without its key proves nothing, so this is an error rather \
-         than a reason to connect without presenting one."
+        "a client certificate without its key proves nothing, so a key that \
+         cannot be read is an error rather than a reason to connect without \
+         presenting one. The key at {path} could not be read"
     )]
     ClientKeyUnreadable {
         path: PathBuf,
@@ -1256,7 +1256,7 @@ pub enum BalanceError {
         source: std::io::Error,
     },
 
-    #[error("TLS could not be configured: {source}")]
+    #[error("TLS could not be configured")]
     Tls {
         #[source]
         source: tonic::transport::Error,
@@ -1842,5 +1842,146 @@ mod tests {
             endpoint(&addr.to_string(), Some(&tls), REQUEST_TIMEOUT),
             Err(BalanceError::Tls { .. })
         ));
+    }
+
+    /// The `Error::source()` walk a caller performs, inlined.
+    ///
+    /// This is `yadgar-telemetry`'s `diagnose::chain` byte for byte. It is
+    /// COPIED rather than depended on because the property under test is a
+    /// property of THIS crate's messages, and taking a dependency on the
+    /// telemetry crate to assert it would make `dial` — which every other
+    /// module dials through — depend on the crate that renders its errors.
+    fn flattened(error: &dyn std::error::Error) -> String {
+        let mut rendered = error.to_string();
+        let mut source = error.source();
+        while let Some(current) = source {
+            rendered.push_str(": ");
+            rendered.push_str(&current.to_string());
+            source = current.source();
+        }
+        rendered
+    }
+
+    /// LEDGER 737. A variant that marks a field `#[source]` must not also
+    /// interpolate that field into its own `#[error]` string.
+    ///
+    /// A caller that walks the chain appends every layer itself, so a message
+    /// that already carries the layer prints the inner cause TWICE. The cause
+    /// is asserted to appear exactly ONCE, and the `#[source]` link is asserted
+    /// to still be there — dropping the interpolation must not be done by
+    /// dropping the attribute, which would delete the information instead of
+    /// moving it.
+    ///
+    /// The inner cause is a SENTINEL rather than a real `io::Error` message so
+    /// the count does not depend on how a platform words `ENOENT`.
+    #[test]
+    fn a_variant_that_marks_a_source_does_not_also_interpolate_it() {
+        const SENTINEL: &str = "sentinel-inner-cause";
+        let io = || std::io::Error::new(std::io::ErrorKind::NotFound, SENTINEL);
+        let path = || PathBuf::from("/nonexistent/pem");
+
+        let cases: Vec<(&str, BalanceError)> = vec![
+            (
+                "Dns",
+                BalanceError::Dns {
+                    host: "task-db".to_string(),
+                    source: io(),
+                },
+            ),
+            (
+                "CaUnreadable",
+                BalanceError::CaUnreadable {
+                    path: path(),
+                    source: io(),
+                },
+            ),
+            (
+                "CaUnparsable",
+                BalanceError::CaUnparsable {
+                    path: path(),
+                    // `Base64Decode` is the one `pem::Error` variant that carries
+                    // caller-supplied text, so it is the only one that can hold
+                    // the sentinel.
+                    source: rustls_pki_types::pem::Error::Base64Decode(SENTINEL.to_string()),
+                },
+            ),
+            (
+                "ClientCertificateUnreadable",
+                BalanceError::ClientCertificateUnreadable {
+                    path: path(),
+                    source: io(),
+                },
+            ),
+            (
+                "ClientKeyUnreadable",
+                BalanceError::ClientKeyUnreadable {
+                    path: path(),
+                    source: io(),
+                },
+            ),
+        ];
+
+        for (variant, error) in cases {
+            assert!(
+                std::error::Error::source(&error).is_some(),
+                "{variant} must keep its `#[source]` link — the cause moves to \
+                 the chain, it does not go away"
+            );
+            let flat = flattened(&error);
+            assert_eq!(
+                flat.matches(SENTINEL).count(),
+                1,
+                "{variant} prints its cause {} time(s) in a walked chain, not \
+                 once: {flat}",
+                flat.matches(SENTINEL).count()
+            );
+        }
+    }
+
+    /// LEDGER 737, stated as the whole operator-facing line rather than as a
+    /// count, so the diff shows a human what a log actually reads.
+    #[test]
+    fn the_walked_message_for_an_unreadable_bundle_reads_end_to_end() {
+        let error = BalanceError::CaUnreadable {
+            path: PathBuf::from("/nonexistent/ca.pem"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+            ),
+        };
+        assert_eq!(
+            flattened(&error),
+            "TLS was requested, so a CA certificate bundle that cannot be read \
+             is an error rather than a reason to connect in cleartext. The \
+             bundle at /nonexistent/ca.pem could not be read: No such file or \
+             directory (os error 2)"
+        );
+    }
+
+    /// LEDGER 737 for the one variant that cannot be built by hand.
+    ///
+    /// `tonic::transport::Error` is opaque, so `Tls` is reached through the real
+    /// path that produces it. It needs no sentinel: the type renders as
+    /// `transport error` and carries the real cause as its OWN source, so the
+    /// duplication is visible as that phrase appearing twice. This is the
+    /// measured example ledger 737 was filed on.
+    #[test]
+    fn the_tls_variant_does_not_repeat_the_transport_layer() {
+        let addr: SocketAddr = "10.0.0.1:50051".parse().unwrap();
+        let tls = ClientTlsConfig::new().domain_name("not a server name");
+        let error = match endpoint(&addr.to_string(), Some(&tls), REQUEST_TIMEOUT) {
+            Err(error) => error,
+            Ok(_) => panic!("a host that is not a valid server name must be refused"),
+        };
+        let flat = flattened(&error);
+        assert_eq!(
+            flat.matches("transport error").count(),
+            1,
+            "the transport layer must appear once, not twice: {flat}"
+        );
+        assert_eq!(
+            flat,
+            "TLS could not be configured: transport error: invalid dns name"
+        );
     }
 }
