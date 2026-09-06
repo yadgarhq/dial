@@ -22,6 +22,8 @@
 //! port, so the balancer never holds an endpoint nothing is listening on. That is
 //! a property of the test rig, not of the crate.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -32,8 +34,61 @@ use yadgar_dial::TlsOptions;
 
 mod common;
 
-use common::{bind_all, pki, ready, Leaf, Pki, TempPem};
+use common::{bind_all, pki, ready, unique_name, Leaf, Pki, TempPem};
 use rcgen::ExtendedKeyUsagePurpose;
+
+/// The SEQUENTIAL property of [`unique_name`], and it is a mutation guard rather
+/// than a reproduction — stated plainly because the distinction was measured. It
+/// PASSES against the clock-based name this change replaces: same-thread
+/// readings advance by tens of nanoseconds and never repeat, so a sequential
+/// assertion cannot see the defect.
+///
+/// MUTATION: replace `fetch_add(1, ..)` with `load(..)` and this fails on every
+/// run.
+///
+/// It lives in this file rather than in `common` because a `#[test]` there is
+/// compiled into all three integration binaries.
+#[test]
+fn two_temporary_names_are_never_the_same_name() {
+    assert_ne!(unique_name(), unique_name());
+
+    let many: HashSet<String> = (0..1000).map(|_| unique_name()).collect();
+    assert_eq!(many.len(), 1000, "1000 names must be 1000 distinct names");
+}
+
+/// THE CONCURRENT PROPERTY, which is the one that reproduces the defect, and it
+/// is the failing test this fix was written against. Cross-thread readings of
+/// `SystemTime::now()` repeat constantly; same-thread ones do not, which is why
+/// only a threaded assertion can see it.
+#[test]
+fn concurrent_names_are_all_distinct() {
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 2000;
+
+    let start = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                (0..PER_THREAD).map(|_| unique_name()).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let all: Vec<String> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let distinct: HashSet<&String> = all.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        THREADS * PER_THREAD,
+        "{} of {} names collided across {THREADS} threads",
+        THREADS * PER_THREAD - distinct.len(),
+        THREADS * PER_THREAD
+    );
+}
 
 /// The name the test certificates are issued for, and the name the test rig
 /// listens on.
