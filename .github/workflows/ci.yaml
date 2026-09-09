@@ -38,6 +38,7 @@ jobs:
     uses: yadgarhq/actions/.github/workflows/ci-pr.yaml@main
     permissions:
       contents: read
+      checks: read
 
   # THE SAME SHARED WORKFLOW ON THE PUSH PATH, where the credential is needed
   # and where nothing unreviewed runs. A push to `main` here is a merge that has
@@ -57,6 +58,7 @@ jobs:
     uses: yadgarhq/actions/.github/workflows/ci-pr.yaml@main
     permissions:
       contents: read
+      checks: read
     secrets:
       RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
       RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
