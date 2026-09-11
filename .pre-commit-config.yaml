@@ -42,6 +42,12 @@ repos:
       - id: actionlint
       - id: cargo-fmt
       - id: cargo-clippy
+      # LEDGER 719. Mechanical ceilings on file and function size (MAX_FILE_LINES
+      # 500, MAX_FN_LINES 120). This repository was over the file ceiling on one
+      # file — src/lib.rs — and under the function ceiling everywhere; the PR
+      # that adds these two ids also splits that file below the ceiling.
+      - id: complexity
+      - id: cargo-clippy-complexity
       - id: cargo-deny
       - id: observe-coverage
       - id: helm-lint
