@@ -52,8 +52,22 @@
     - feat(recall): return partial results when one provider is unhealthy
     - feat!: drop the by-name arm of GetWikiPage
 
-  `!` marks a breaking change and implies a major bump. `feat:` implies minor,
-  everything else patch. The highest bullet wins.
+  The bump follows Conventional Commits, classified by `bump_for` in
+  `scripts/pr_body.py` (`yadgarhq/actions`): a `!` bullet classifies as major,
+  a `feat:` bullet classifies as minor, every other bullet classifies as
+  patch. The Changelog's bump is the highest classification among its
+  bullets.
+
+  Check the latest `v*` tag's major version.
+
+  If that major version is 0, the ladder shifts down one step. This shift
+  runs in `ci-pr.yaml`'s `version` job (`yadgarhq/actions`), not in
+  `bump_for`. A major-classified bullet then bumps MINOR. Every other bullet
+  then bumps PATCH.
+
+  If that major version is 1 or higher, the classification applies
+  unshifted. A major-classified bullet bumps MAJOR. A minor-classified
+  bullet bumps MINOR. A patch-classified bullet bumps PATCH.
 -->
 
 ## Verification
