@@ -152,7 +152,7 @@
 //! | --- | --- |
 //! | `RESOLVE_TIMEOUT` | a resolver that stopped answering, BEFORE any connection |
 //! | `connect_timeout` | a TCP connect that does not complete |
-//! | HTTP/2 keepalive | a peer that VANISHED without closing its connection |
+//! | `KEEPALIVE_INTERVAL` / `KEEPALIVE_TIMEOUT` | a peer that VANISHED without closing its connection |
 //! | [`default_request_timeout`] | a peer that is alive, connected, answering pings, and never replies |
 //!
 //! **The first bounds a phase the other three never reach.** Every entry point
@@ -279,14 +279,21 @@ fn report_never_resolved(host: &str, never_resolved: bool) {
 ///
 /// Kubernetes headless DNS has a short TTL, and pods come and go on deploys and
 /// autoscaling events. Five seconds is well inside a rolling update's window.
-const RERESOLVE: Duration = Duration::from_secs(5);
+const RERESOLVE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): sized to Kubernetes headless DNS's TTL and a rolling update's window, not an operator's choice.
 
 /// How long one phase of establishing a connection may take.
 ///
 /// A dead pod must not hold a request open until the caller's deadline. Named
 /// rather than written twice because it bounds TWO phases once TLS is on — see
 /// `endpoint`, where the reason it has to be stated twice is recorded.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2); // ADR-0569-EXCEPTION(CC): shared with the TLS handshake bound in TlsOptions::prepare — one value, not two.
+
+/// How often an established connection sends an HTTP/2 PING to notice a peer
+/// that vanished without closing it — the common case when a node goes away.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10); // ADR-0569-EXCEPTION(CC): interval + timeout must stay below REQUEST_TIMEOUT, pinned by a test.
+
+/// How long one PING may go unanswered before the connection is dropped.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3); // ADR-0569-EXCEPTION(CC): see KEEPALIVE_INTERVAL.
 
 /// How long ONE request may take once a connection has been chosen for it.
 ///
@@ -311,7 +318,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// It is a CEILING on the pathological case, not a latency target. A healthy
 /// call through `dial` is a single query away from its answer and finishes
 /// three orders of magnitude inside this.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30); // ADR-0569-EXCEPTION(CC): above gateway AUTH_DEADLINE 10s, below the 60s ingress idle timeout.
 
 /// How long ONE resolution may take before it is abandoned.
 ///
@@ -338,7 +345,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Five seconds is one `RERESOLVE` tick: a wedged resolver costs the refresh loop
 /// at most a doubled interval, and costs startup an error instead of a wait with
 /// no end.
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): <= RERESOLVE (one tick), pinned by a test.
 
 /// What changed between two resolutions.
 ///
