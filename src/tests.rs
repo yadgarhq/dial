@@ -180,6 +180,16 @@ fn resolve_timeout_fits_within_one_reresolve_tick() {
     assert!(RESOLVE_TIMEOUT <= RERESOLVE);
 }
 
+/// KEEPALIVE DETECTION MUST STAY SHORTER THAN `REQUEST_TIMEOUT`, or the
+/// "silent peer" bound fires before the "vanished peer" one ever gets a
+/// chance to — making `KEEPALIVE_INTERVAL`/`KEEPALIVE_TIMEOUT` pointless for
+/// exactly the peer they exist to catch. Both constants are private, so
+/// nothing outside this file can enforce the relationship between them.
+#[test]
+fn keepalive_detection_is_shorter_than_the_request_timeout() {
+    assert!(KEEPALIVE_INTERVAL + KEEPALIVE_TIMEOUT < REQUEST_TIMEOUT);
+}
+
 /// THE BOOT DIAL PUBLISHES THE ABSENCE IT CREATES, and it must, because the
 /// window this metric describes opens at boot and the first tick is
 /// `RERESOLVE` away.

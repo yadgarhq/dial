@@ -17,6 +17,10 @@ use crate::{
     report_never_resolved, CONNECT_TIMEOUT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, REQUEST_TIMEOUT,
 };
 
+/// Floor on the balancer's discovery channel capacity, independent of how
+/// many addresses the first resolution found.
+const MIN_BALANCE_BUFFER: usize = 8; // ADR-0569-EXCEPTION(CC): floor above a rolling update's one-tick remove+insert burst for a small replica count.
+
 /// Which peer an entry in the balancer is.
 ///
 /// **`Unresolved` is the whole of the laziness.** A balanced channel holding no
@@ -294,7 +298,7 @@ pub(crate) async fn connect_with(
         })
         .collect::<Result<Vec<_>, BalanceError>>()?;
 
-    let (channel, tx) = Channel::balance_channel::<Peer>(built.len().max(8));
+    let (channel, tx) = Channel::balance_channel::<Peer>(built.len().max(MIN_BALANCE_BUFFER));
 
     // `tls` is recorded because "is this connection encrypted?" must be
     // answerable from the logs of the process doing the connecting. The
