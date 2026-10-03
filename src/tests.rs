@@ -168,6 +168,18 @@ fn the_names_a_dashboard_queries_are_pinned_to_their_spelling() {
     assert_eq!(UPSTREAM_LABEL, "upstream");
 }
 
+/// `RESOLVE_TIMEOUT`'S OWN DOC COMMENT CLAIMS "a wedged resolver costs the
+/// refresh loop at most a doubled interval" BECAUSE FIVE SECONDS IS ONE
+/// `RERESOLVE` TICK — a claim that is true only while `RESOLVE_TIMEOUT` fits
+/// inside `RERESOLVE`. Both constants are private, so nothing outside this
+/// file can enforce the relationship between them, and nothing inside it did
+/// either: a resolver test exercises what `bounded_lookup` does, not what the
+/// two numbers say about each other.
+#[test]
+fn resolve_timeout_fits_within_one_reresolve_tick() {
+    assert!(RESOLVE_TIMEOUT <= RERESOLVE);
+}
+
 /// THE BOOT DIAL PUBLISHES THE ABSENCE IT CREATES, and it must, because the
 /// window this metric describes opens at boot and the first tick is
 /// `RERESOLVE` away.

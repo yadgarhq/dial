@@ -152,7 +152,7 @@
 //! | --- | --- |
 //! | `RESOLVE_TIMEOUT` | a resolver that stopped answering, BEFORE any connection |
 //! | `connect_timeout` | a TCP connect that does not complete |
-//! | HTTP/2 keepalive | a peer that VANISHED without closing its connection |
+//! | `KEEPALIVE_INTERVAL` / `KEEPALIVE_TIMEOUT` | a peer that VANISHED without closing its connection |
 //! | [`default_request_timeout`] | a peer that is alive, connected, answering pings, and never replies |
 //!
 //! **The first bounds a phase the other three never reach.** Every entry point
@@ -287,6 +287,21 @@ const RERESOLVE: Duration = Duration::from_secs(5);
 /// rather than written twice because it bounds TWO phases once TLS is on — see
 /// `endpoint`, where the reason it has to be stated twice is recorded.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often an established connection sends an HTTP/2 PING to notice a peer
+/// that vanished without closing it — the common case when a node goes away.
+///
+// ADR-0569-EXCEPTION(CC): coupled to `CONNECT_TIMEOUT` and `REQUEST_TIMEOUT`,
+// not an installation knob. The three are the "four bounds" this module's
+// doc table promises together, each catching a different way a peer goes
+// bad; a value picked independently of its siblings would change how fast a
+// vanished peer is noticed relative to the other bounds in the same chain,
+// which is a property of this crate's design rather than of a deployment.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long one PING may go unanswered before the connection is dropped.
+// ADR-0569-EXCEPTION(CC): see `KEEPALIVE_INTERVAL`.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long ONE request may take once a connection has been chosen for it.
 ///

@@ -13,7 +13,9 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use crate::error::BalanceError;
 use crate::resolve::{refresh, resolve};
 use crate::tls::TlsOptions;
-use crate::{report_never_resolved, CONNECT_TIMEOUT, REQUEST_TIMEOUT};
+use crate::{
+    report_never_resolved, CONNECT_TIMEOUT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, REQUEST_TIMEOUT,
+};
 
 /// Which peer an entry in the balancer is.
 ///
@@ -99,8 +101,8 @@ pub(crate) fn endpoint(
         .connect_timeout(CONNECT_TIMEOUT)
         // HTTP/2 keepalive notices a pod that vanished without closing its
         // connection — the common case when a node goes away.
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_timeout(Duration::from_secs(3))
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
         // THE BOUND ON A PEER THAT IS SIMPLY SILENT, which neither of the two
         // above covers. See `REQUEST_TIMEOUT` for the reason a healthy-looking
         // connection needs one at all.
