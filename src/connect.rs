@@ -19,7 +19,34 @@ use crate::{
 
 /// Floor on the balancer's discovery channel capacity, independent of how
 /// many addresses the first resolution found.
-const MIN_BALANCE_BUFFER: usize = 8; // ADR-0569-EXCEPTION(CC): floor above a rolling update's one-tick remove+insert burst for a small replica count.
+///
+/// **LEDGER 1401: THIS IS NOT ONE TICK'S BURST, and sizing it as one is what
+/// failed.** It was 8, "above a rolling update's one-tick remove+insert
+/// burst". But tonic's balancer consumes this channel only while it is
+/// handling a request (see `resolve::give`), so what the channel must hold is
+/// every change since the last REQUEST, not since the last tick. On
+/// kind-yadgar a gateway with no traffic to `iam` filled 8 with the boot
+/// inserts and three ticks of changes — one rolling update and the first half
+/// of the next — and the second half of that update had nowhere to go.
+///
+/// A rolling update of `n` replicas costs `2n` changes, so 1024 is hundreds of
+/// rollouts of an idle upstream. It costs nothing until used: tokio's bounded
+/// channel allocates its blocks as values arrive, not at construction. Past
+/// it, `resolve::give` holds a tick back WHOLE and keeps resolving, so a full
+/// channel serves the last set that fit rather than a half-applied one. A diff
+/// larger than the whole capacity is never queued — `try_reserve_many`
+/// refuses it outright — which needs over 512 replicas to change at once.
+const BALANCE_BUFFER: usize = 1024; // ADR-0569-EXCEPTION(CC): sized to the changes an UNCALLED channel accumulates (2n per rolling update), not one tick's burst.
+
+/// The capacity of the balancer's discovery channel for a dial that found
+/// `initial` addresses at boot.
+pub(crate) const fn balance_capacity(initial: usize) -> usize {
+    if initial > BALANCE_BUFFER {
+        initial
+    } else {
+        BALANCE_BUFFER
+    }
+}
 
 /// Which peer an entry in the balancer is.
 ///
@@ -298,7 +325,7 @@ pub(crate) async fn connect_with(
         })
         .collect::<Result<Vec<_>, BalanceError>>()?;
 
-    let (channel, tx) = Channel::balance_channel::<Peer>(built.len().max(MIN_BALANCE_BUFFER));
+    let (channel, tx) = Channel::balance_channel::<Peer>(balance_capacity(built.len()));
 
     // `tls` is recorded because "is this connection encrypted?" must be
     // answerable from the logs of the process doing the connecting. The

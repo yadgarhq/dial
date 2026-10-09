@@ -13,7 +13,7 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
 use super::*;
-use crate::connect::{authority, connect_with, endpoint, Peer, Target};
+use crate::connect::{authority, balance_capacity, connect_with, endpoint, Peer, Target};
 use crate::resolve::{bounded_lookup, refresh};
 
 /// The dial every case here re-resolves, with the caller's own bound rather
@@ -747,4 +747,147 @@ fn the_tls_variant_does_not_repeat_the_transport_layer() {
         flat,
         "TLS could not be configured: transport error: invalid dns name"
     );
+}
+
+/// Two addresses no other set below shares, so every change of set is a full
+/// rolling update: two removals and two insertions.
+fn pods(generation: u8) -> BTreeSet<SocketAddr> {
+    BTreeSet::from([
+        SocketAddr::from(([10, 0, generation, 1], 50051)),
+        SocketAddr::from(([10, 0, generation, 2], 50051)),
+    ])
+}
+
+/// A resolver that answers with each set in `sets` on successive ticks and
+/// then with the last one for ever, counting how often it was asked.
+fn rolling(
+    sets: Vec<BTreeSet<SocketAddr>>,
+    calls: Arc<AtomicUsize>,
+) -> impl Fn(String, u16) -> std::future::Ready<Result<BTreeSet<SocketAddr>, BalanceError>> {
+    move |_host, _port| {
+        let tick = calls.fetch_add(1, Ordering::SeqCst);
+        let last = sets.len() - 1;
+        std::future::ready(Ok(sets[tick.min(last)].clone()))
+    }
+}
+
+/// What the balancer would hold after applying everything queued, in order —
+/// which is exactly what `Balance::poll_ready` does on the first request
+/// after an idle stretch (`tower-0.5.3/src/balance/p2c/service.rs:105-127`).
+fn folded(queued: &[String]) -> BTreeSet<String> {
+    let mut held = BTreeSet::new();
+    for change in queued {
+        if let Some(peer) = change.strip_prefix("insert ") {
+            held.insert(peer.to_string());
+        } else if let Some(peer) = change.strip_prefix("remove ") {
+            held.remove(peer);
+        }
+    }
+    held
+}
+
+fn as_peers(set: &BTreeSet<SocketAddr>) -> BTreeSet<String> {
+    set.iter()
+        .map(|a| format!("{:?}", Peer::Address(*a)))
+        .collect()
+}
+
+/// LEDGER 1401: AN IDLE CHANNEL MUST NOT FREEZE ITS VIEW OF THE UPSTREAM.
+///
+/// tonic's balancer reads its discovery channel only inside `poll_ready`, and
+/// the `Buffer` worker in front of it calls `poll_ready` only when a request
+/// is queued. So on a channel nobody calls, NOTHING consumes what this loop
+/// sends. The channel was sized for one tick's burst, so a few rolling
+/// updates of an idle upstream filled it, the loop parked in `send().await`
+/// half-way through a diff, and stopped resolving. The first request hours
+/// later drained a backlog ending on pods that no longer existed and failed
+/// with `tcp connect error` — kind-yadgar 2026-10-09, gateway → iam and
+/// gateway → task.
+///
+/// Four rolling updates, no request in between, at the capacity the boot
+/// dial really uses. What is queued must end on the LAST set, and the loop
+/// must have gone on resolving the whole time.
+#[tokio::test(start_paused = true)]
+async fn an_idle_channel_ends_on_the_latest_set_after_many_rolling_updates() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(balance_capacity(2));
+
+    // What the boot dial queued and nobody has consumed: the first set.
+    for addr in pods(0) {
+        let built = endpoint(&addr.to_string(), None, REQUEST_TIMEOUT).unwrap();
+        tx.send(Change::Insert(Peer::Address(addr), built))
+            .await
+            .unwrap();
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sets = vec![pods(1), pods(2), pods(3), pods(4)];
+
+    let _ = tokio::time::timeout(
+        RERESOLVE * 6 + Duration::from_secs(1),
+        refresh(
+            target(None),
+            pods(0),
+            false,
+            tx,
+            rolling(sets, calls.clone()),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        folded(&drain(&mut rx)),
+        as_peers(&pods(4)),
+        "the first request after an idle stretch applies the whole queue, so the queue must \
+         end on the latest resolution — not on pods a rolling update already removed"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 6,
+        "the loop must keep resolving while nobody consumes the channel; it resolved {} times \
+         in six ticks",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+/// A DIFF THAT DOES NOT FIT IS NOT HALF-APPLIED, AND IT IS NOT LOST.
+///
+/// Past whatever capacity the channel has, the loop must neither park nor
+/// queue part of a rolling update — a half-applied diff is the exact state
+/// the 2026-10-09 failure drained (one removal sent, its insertion not). It
+/// gives nothing, keeps resolving, and gives the whole diff on the first tick
+/// after room appears.
+#[tokio::test(start_paused = true)]
+async fn a_diff_that_does_not_fit_is_given_whole_once_there_is_room() {
+    // Room for four, one already taken: a two-pod rolling update (four
+    // changes) does not fit until that one is consumed.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    tx.send(Change::Remove(Peer::Unresolved)).await.unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let looping = tokio::spawn(refresh(
+        target(None),
+        pods(0),
+        false,
+        tx,
+        rolling(vec![pods(1)], calls.clone()),
+    ));
+
+    tokio::time::sleep(RERESOLVE * 2 + Duration::from_secs(1)).await;
+    assert_eq!(
+        drain(&mut rx),
+        vec!["remove Unresolved".to_string()],
+        "a diff that does not fit must not be queued in part"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "the loop must not park on a full channel"
+    );
+
+    // The drain above is the request that finally polled the balancer.
+    tokio::time::sleep(RERESOLVE).await;
+    assert_eq!(
+        folded(&drain(&mut rx)),
+        as_peers(&pods(1)),
+        "once there is room, the whole diff is given"
+    );
+    looping.abort();
 }

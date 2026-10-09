@@ -1,18 +1,16 @@
 //! The re-resolution loop: keep polling DNS, diff what came back against what
 //! the balancer already holds, and apply the difference.
 //!
-//! Split out of `lib.rs` by LEDGER 719. The one behavioural change made in
-//! the split: [`re_resolve`]'s per-tick application of a resolved diff was
-//! extracted into [`apply_changes`] so the function stays under the
-//! function-length ceiling the split also adopts. The extracted code is
-//! unchanged — same sends, same log lines, same order — and `apply_changes`
-//! returning `false` (send failed, channel dropped) is exactly the case that
-//! used to `return` straight out of `re_resolve`'s `for` loop.
+//! Split out of `lib.rs` by LEDGER 719. LEDGER 1401 then changed how a tick's
+//! diff reaches the balancer: [`give`] queues it whole or not at all, and
+//! never waits for room — see there for the idle-channel failure that waiting
+//! caused.
 
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
 
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 use tonic::transport::channel::Change;
 use tonic::transport::{ClientTlsConfig, Endpoint};
@@ -145,45 +143,34 @@ async fn re_resolve<R, F>(
         }
 
         let changes = diff(&current, &resolved);
-        if !apply_changes(
+        match give(
             &host,
             tls.as_ref(),
             request_timeout,
             &tx,
             &mut current,
             changes,
-        )
-        .await
-        {
-            tracing::debug!(host, "channel dropped; ending re-resolution");
-            return;
-        }
-
-        // THE SEED GOES ONLY ONCE A RESOLVED ADDRESS HAS BEEN GIVEN, and
-        // "given" is `current` — the same distinction the rest of this loop
-        // draws, for the same reason.
-        //
-        // GATING THIS ON `!resolved.is_empty()` COMPILES, READS IDENTICALLY AND
-        // IS WRONG. A tick where DNS answers and every `endpoint` above fails
-        // to build sends nothing, so withdrawing the seed on the strength of
-        // the ANSWER would leave the balancer holding no endpoint at all — the
-        // empty-balancer hang this seed exists to prevent, reintroduced by the
-        // code that retires it.
-        //
-        // AFTER the insertions rather than before, so there is no tick on which
-        // the balancer holds nothing.
-        if seeded && !current.is_empty() {
-            if tx.send(Change::Remove(Peer::Unresolved)).await.is_err() {
+            seeded,
+        ) {
+            Given::Dropped => {
                 tracing::debug!(host, "channel dropped; ending re-resolution");
                 return;
             }
-            seeded = false;
-            tracing::info!(
-                host,
-                count = current.len(),
-                "the upstream resolved; the name is withdrawn and traffic is balanced across \
-                 replicas"
-            );
+            // NOTHING WAS QUEUED AND `current` IS UNCHANGED, so the next tick
+            // diffs from the same place against a fresher answer. Not a
+            // `return` and not a wait: see `give`.
+            Given::Deferred => continue,
+            Given::All { withdrew_seed } => {
+                if withdrew_seed {
+                    seeded = false;
+                    tracing::info!(
+                        host,
+                        count = current.len(),
+                        "the upstream resolved; the name is withdrawn and traffic is balanced \
+                         across replicas"
+                    );
+                }
+            }
         }
 
         // AND AGAIN, BECAUSE THIS IS THE ONLY PATH THAT CHANGED `current`.
@@ -195,70 +182,151 @@ async fn re_resolve<R, F>(
     }
 }
 
-/// Apply one tick's [`diff`] to the balancer, advancing `current` as sends
-/// succeed and logging exactly as [`re_resolve`] did inline before this was
-/// split out of it.
+/// What [`give`] did with one tick's diff.
+enum Given {
+    /// Every change was queued, and `current` now says so.
+    All { withdrew_seed: bool },
+    /// The channel had no room for the whole diff, so NONE of it was queued.
+    Deferred,
+    /// The receiver is gone: the channel was dropped.
+    Dropped,
+}
+
+/// Queue one tick's [`diff`] for the balancer — ALL OF IT OR NONE OF IT, and
+/// never by waiting.
 ///
-/// Returns `false` the moment a send finds the channel dropped, which is the
-/// caller's signal to stop re-resolving rather than continue the tick.
-/// Otherwise returns `true` once every change has been applied — including a
-/// change skipped because its `Endpoint` failed to build, which is neither a
-/// dropped channel nor recorded into `current` (see the comment at that call).
-async fn apply_changes(
+/// **LEDGER 1401: THIS USED TO `send().await`, AND ON AN IDLE CHANNEL THAT
+/// WAITS FOR EVER.** tonic's balancer reads the discovery channel only from
+/// `Balance::poll_ready` (`tower-0.5.3/src/balance/p2c/service.rs:208-211`),
+/// and the `Buffer` worker in front of it calls `poll_ready` only when it holds
+/// a request (`tower-0.5.3/src/buffer/worker.rs:147-170`). On a channel nobody
+/// calls, nothing consumes what this loop queues. Once the channel filled, the
+/// loop parked mid-diff and stopped resolving; the first request hours later
+/// drained a queue that ended part-way through an old rolling update, on pods
+/// that no longer existed (kind-yadgar, 2026-10-09: gateway → iam and
+/// gateway → task, `tcp connect error`).
+///
+/// So the whole tick is reserved up front with `try_reserve_many`, and a diff
+/// that does not fit is [`Given::Deferred`]: nothing is queued, `current` is
+/// left alone, and the loop goes on resolving. Whatever the queue holds then
+/// still ends on a set this loop really resolved, and the next tick with room
+/// queues the diff from there to the newest answer in one piece. The
+/// capacity that makes this rare is `connect::BALANCE_BUFFER`.
+///
+/// `seeded` is whether the balancer still holds the name. Its withdrawal is
+/// part of the same reservation, AFTER the insertions, so there is no point in
+/// the queue at which the balancer would hold nothing.
+fn give(
     host: &str,
     tls: Option<&ClientTlsConfig>,
     request_timeout: std::time::Duration,
     tx: &Sender<Change<Peer, Endpoint>>,
     current: &mut BTreeSet<SocketAddr>,
     changes: Vec<Change<SocketAddr, ()>>,
-) -> bool {
-    for change in changes {
+    seeded: bool,
+) -> Given {
+    let outgoing = build(host, tls, request_timeout, changes);
+
+    // THE SEED GOES ONLY ONCE A RESOLVED ADDRESS HAS BEEN GIVEN, and "given"
+    // is what `current` will hold after this tick — the same distinction the
+    // rest of the loop draws, for the same reason.
+    //
+    // GATING THIS ON `!resolved.is_empty()` COMPILES, READS IDENTICALLY AND IS
+    // WRONG. A tick where DNS answers and every `endpoint` fails to build
+    // queues nothing, so withdrawing the seed on the strength of the ANSWER
+    // would leave the balancer holding no endpoint at all — the empty-balancer
+    // hang this seed exists to prevent, reintroduced by the code that retires
+    // it.
+    let mut after = current.clone();
+    for change in &outgoing {
         match change {
-            Change::Insert(addr, ()) => {
-                // Defensive: the configuration was already accepted once in
-                // `connect_tls`, and nothing here depends on the address, so
-                // this cannot fail for one pod and succeed for another. It
-                // is written out anyway because the wrong recovery — adding
-                // the endpoint in cleartext — is the exact downgrade this
-                // module exists to prevent, and it must not be reachable
-                // even by accident.
-                let built = match endpoint(&addr.to_string(), tls, request_timeout) {
-                    Ok(built) => built,
-                    Err(e) => {
-                        tracing::error!(
-                            host, %addr, error = %e,
-                            "could not build a TLS endpoint; the address is skipped rather than dialled in cleartext"
-                        );
-                        // AND NOT RECORDED. `current` advances only where a
-                        // send succeeded, so this address is still missing
-                        // from it next tick and `diff` offers it again.
-                        continue;
-                    }
-                };
-                // The receiver is gone, so the channel was dropped: stop
-                // rather than spin against a dead sender. The check at the
-                // top of the tick does not replace this one — the receiver
-                // can be dropped part-way through a batch of changes.
-                if tx
-                    .send(Change::Insert(Peer::Address(addr), built))
-                    .await
-                    .is_err()
-                {
-                    return false;
-                }
+            Change::Insert(addr, _) => after.insert(*addr),
+            Change::Remove(addr) => after.remove(addr),
+        };
+    }
+    let withdraw_seed = seeded && !after.is_empty();
+
+    let needed = outgoing.len() + usize::from(withdraw_seed);
+    if needed == 0 {
+        return Given::All {
+            withdrew_seed: false,
+        };
+    }
+    let mut permits = match tx.try_reserve_many(needed) {
+        Ok(permits) => permits,
+        Err(TrySendError::Closed(())) => return Given::Dropped,
+        Err(TrySendError::Full(())) => {
+            tracing::warn!(
+                host,
+                needed,
+                room = tx.capacity(),
+                "the balancer has not consumed its endpoint changes (no request since they were \
+                 queued); this tick's are held back whole and offered again on the next"
+            );
+            return Given::Deferred;
+        }
+    };
+
+    for change in outgoing {
+        // `try_reserve_many` handed out exactly `needed` permits.
+        let Some(permit) = permits.next() else { break };
+        match change {
+            Change::Insert(addr, built) => {
+                permit.send(Change::Insert(Peer::Address(addr), built));
                 current.insert(addr);
                 tracing::info!(host, %addr, "endpoint added");
             }
             Change::Remove(addr) => {
-                if tx.send(Change::Remove(Peer::Address(addr))).await.is_err() {
-                    return false;
-                }
+                permit.send(Change::Remove(Peer::Address(addr)));
                 current.remove(&addr);
                 tracing::info!(host, %addr, "endpoint removed");
             }
         }
     }
-    true
+    if withdraw_seed {
+        if let Some(permit) = permits.next() {
+            permit.send(Change::Remove(Peer::Unresolved));
+        }
+    }
+    Given::All {
+        withdrew_seed: withdraw_seed,
+    }
+}
+
+/// Build the [`Endpoint`] for every insertion in one tick's [`diff`], in the
+/// diff's order.
+///
+/// An address whose `Endpoint` fails to build is DROPPED from the result, and
+/// so never recorded into `current`: it is still missing from it next tick, and
+/// `diff` offers it again.
+fn build(
+    host: &str,
+    tls: Option<&ClientTlsConfig>,
+    request_timeout: std::time::Duration,
+    changes: Vec<Change<SocketAddr, ()>>,
+) -> Vec<Change<SocketAddr, Endpoint>> {
+    changes
+        .into_iter()
+        .filter_map(|change| match change {
+            Change::Remove(addr) => Some(Change::Remove(addr)),
+            // Defensive: the configuration was already accepted once in
+            // `connect_tls`, and nothing here depends on the address, so this
+            // cannot fail for one pod and succeed for another. It is written
+            // out anyway because the wrong recovery — adding the endpoint in
+            // cleartext — is the exact downgrade this module exists to
+            // prevent, and it must not be reachable even by accident.
+            Change::Insert(addr, ()) => match endpoint(&addr.to_string(), tls, request_timeout) {
+                Ok(built) => Some(Change::Insert(addr, built)),
+                Err(e) => {
+                    tracing::error!(
+                        host, %addr, error = %e,
+                        "could not build a TLS endpoint; the address is skipped rather than dialled in cleartext"
+                    );
+                    None
+                }
+            },
+        })
+        .collect()
 }
 
 /// Report a tick that produced no addresses, at the level the SITUATION
