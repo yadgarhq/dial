@@ -279,6 +279,11 @@ fn report_never_resolved(host: &str, never_resolved: bool) {
 ///
 /// Kubernetes headless DNS has a short TTL, and pods come and go on deploys and
 /// autoscaling events. Five seconds is well inside a rolling update's window.
+///
+/// **Resolving every tick is not the same as the balancer HOLDING every tick's
+/// answer** (ledger 1401). The balancer applies what this loop queues only when
+/// it handles a request, so an idle channel catches up on its first request,
+/// from a queue that `resolve::give` keeps ending on a resolved set.
 const RERESOLVE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): sized to Kubernetes headless DNS's TTL and a rolling update's window, not an operator's choice.
 
 /// How long one phase of establishing a connection may take.
