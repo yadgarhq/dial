@@ -169,6 +169,12 @@
 //! [`connect_with_request_timeout`] and [`connect_tls_with_request_timeout`]
 //! take the caller's own.
 //!
+//! **A deployed service takes its own from its chart** (ADR-0925, Q-C1):
+//! [`request_timeout_from_lookup`] reads the variable the consumer names, with
+//! no fallback, and refuses a value outside [`min_request_timeout`] (one second
+//! above keepalive detection) ..= [`max_request_timeout`] (one second below
+//! the 60s ingress idle timeout).
+//!
 //! # This file
 //!
 //! LEDGER 719 split what used to be one 1987-line `lib.rs` along the seams
@@ -189,6 +195,7 @@ use tonic::transport::channel::Change;
 
 mod connect;
 mod error;
+mod request_timeout;
 mod resolve;
 mod tls;
 
@@ -196,6 +203,9 @@ pub use connect::{
     connect, connect_tls, connect_tls_with_request_timeout, connect_with_request_timeout,
 };
 pub use error::BalanceError;
+pub use request_timeout::{
+    max_request_timeout, min_request_timeout, request_timeout_from_lookup, RequestTimeoutError,
+};
 pub use tls::TlsOptions;
 
 /// The gauge saying that this process is dialling an upstream it has NEVER had
@@ -319,6 +329,11 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3); // ADR-0569-EXCEPTIO
 /// three times the longest deliberate deadline in the tree and half the point
 /// where the caller has already gone. A caller that needs another number passes
 /// one rather than editing this.
+///
+/// **IT IS THE DEFAULT, NOT THE KNOB** (ADR-0925, Q-C1). A deployed service
+/// reads its bound from its chart through [`request_timeout_from_lookup`],
+/// whose chart default is this same 30s; this constant is what [`connect`] and
+/// [`connect_tls`] apply to a caller that passes none.
 ///
 /// It is a CEILING on the pathological case, not a latency target. A healthy
 /// call through `dial` is a single query away from its answer and finishes
