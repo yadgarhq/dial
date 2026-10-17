@@ -96,7 +96,25 @@ passes one:
 
 ```rust
 let channel =
-    yadgar_dial::connect_with_request_timeout("task-db", 50051, Duration::from_secs(5)).await?;
+    yadgar_dial::connect_with_request_timeout("task-db", 50051, Duration::from_secs(20)).await?;
+```
+
+**A deployed service reads its bound from its chart** (ADR-0925): the timeout
+is a chart value per consuming service, so an operator tunes it per
+environment without a release. `request_timeout_from_lookup` reads the
+variable the consumer names, with no compiled-in fallback, and refuses a value
+outside 14..=59 seconds — at or below keepalive detection (13s) the request
+bound fires before keepalive can notice a vanished peer, and at or above 60s
+the answer arrives after the ingress has given up. Every refusal names the
+variable and the chart key that renders it:
+
+```rust
+let timeout = yadgar_dial::request_timeout_from_lookup(
+    |name| std::env::var(name).ok(),
+    "TASK_REQUEST_TIMEOUT_SECONDS",
+    "task.requestTimeoutSeconds",
+)?;
+let channel = yadgar_dial::connect_with_request_timeout("task", 50051, timeout).await?;
 ```
 
 **It is a backstop, not the caller's deadline.** A caller that sets a gRPC
