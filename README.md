@@ -145,6 +145,45 @@ on the wait for the response to begin; and a request that has not been handed to
 a connection yet because no endpoint is ready, which is the balancer's readiness
 one layer up.
 
+### Carrying the caller's deadline inward (ADR-1019)
+
+tonic enforces a `grpc-timeout` on both sides of a call, but it does not pass
+one on: a handler that calls an inner hop sends a fresh request with no
+deadline. A hop that serves gRPC therefore captures its caller's deadline once,
+at handler entry, and runs every inner call under it:
+
+```rust
+let deadline = yadgar_dial::Deadline::of(&request); // before into_inner()
+let reply = deadline
+    .call(ceiling, tonic::Request::new(message), |r| client.clone().get_task(r))
+    .await?; // grpc-timeout = min(ceiling, remaining - DEADLINE_MARGIN)
+```
+
+`ceiling` is the request timeout the channel was dialled with.
+
+**The margin.** `DEADLINE_MARGIN` (50 ms, Max's ruling on ADR-1019) is kept
+back from the caller's remaining time. The inner call therefore fails before
+the caller's deadline. The hop's own `DEADLINE_EXCEEDED` path then runs and
+records before tonic's server drops the handler. Without the margin, the
+handler is dropped, telemetry records `UNRECORDED` and the caller sees
+`CANCELLED`. tonic reports its own timer as `CANCELLED` "Timeout expired";
+`Deadline::call` turns a `CANCELLED` that arrives at or after the stamped
+bound into `DEADLINE_EXCEEDED`. An earlier `CANCELLED` passes through.
+
+**The edges.** With no incoming deadline the inner request is stamped with the
+ceiling, with no margin, so the next hop is still told. The propagated value is
+never raised to `min_request_timeout()`: that floor applies to the chart value,
+not to a caller's remaining time. A remaining time at or below the margin
+returns `DEADLINE_EXCEEDED` and nothing is sent. `Deadline::apply` stamps a
+request without running it, for a caller that cannot use `call`. A caller with
+no incoming request (the gateway) uses `Deadline::after(its own per-call
+deadline)`.
+
+A `-db` service needs no call here. tonic's server drops a handler when its
+`grpc-timeout` expires, and a pending pool acquire inside the handler is
+dropped with it. So the acquire is bounded by min(`acquireTimeoutSeconds`,
+remaining) once the caller sends the header.
+
 ## What it tells an operator
 
 One metric: `yadgar_dial_upstream_never_resolved`, a gauge labelled `upstream`.
