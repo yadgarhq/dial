@@ -151,10 +151,16 @@ impl Deadline {
     /// [`Deadline::apply`], run `f`, and report a call cut off at its bound
     /// as `DEADLINE_EXCEEDED`.
     ///
+    /// The bound is enforced HERE too, not only by tonic. tonic's client timer
+    /// sits inside each connection, so it does not run while a request waits
+    /// for a ready endpoint, a TCP connect or a TLS handshake. `call` drops
+    /// `f`'s future at the bound wherever it is waiting.
+    ///
     /// tonic reports its own timer, on either side of the call, as
     /// `CANCELLED` "Timeout expired". A `CANCELLED` that arrives once the
-    /// stamped bound has passed is that timer, so it is relabelled; one that
-    /// arrives earlier is somebody else's cancel and passes through.
+    /// stamped bound has passed is that timer, so it is relabelled, with its
+    /// details and metadata kept; one that arrives earlier is somebody else's
+    /// cancel and passes through.
     ///
     /// # Errors
     ///
@@ -173,14 +179,22 @@ impl Deadline {
     {
         let bound = self.apply(ceiling, &mut request)?;
         let expires = Instant::now() + bound;
-        match f(request).await {
-            Err(status) if status.code() == Code::Cancelled && Instant::now() >= expires => {
-                Err(Status::deadline_exceeded(format!(
-                    "inner call cut off at its {bound:?} bound: {}",
-                    status.message()
-                )))
+        match tokio::time::timeout(bound, f(request)).await {
+            Err(_) => Err(Status::deadline_exceeded(format!(
+                "inner call cut off at its {bound:?} bound before it was answered"
+            ))),
+            Ok(Err(status)) if status.code() == Code::Cancelled && Instant::now() >= expires => {
+                Err(Status::with_details_and_metadata(
+                    Code::DeadlineExceeded,
+                    format!(
+                        "inner call cut off at its {bound:?} bound: {}",
+                        status.message()
+                    ),
+                    status.details().to_vec().into(),
+                    status.metadata().clone(),
+                ))
             }
-            other => other,
+            Ok(other) => other,
         }
     }
 }

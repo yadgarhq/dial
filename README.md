@@ -155,7 +155,10 @@ at handler entry, and runs every inner call under it:
 ```rust
 let deadline = yadgar_dial::Deadline::of(&request); // before into_inner()
 let reply = deadline
-    .call(ceiling, tonic::Request::new(message), |r| client.clone().get_task(r))
+    .call(ceiling, tonic::Request::new(message), |r| {
+        let mut client = client.clone(); // a generated client call borrows it
+        async move { client.get_task(r).await }
+    })
     .await?; // grpc-timeout = min(ceiling, remaining - DEADLINE_MARGIN)
 ```
 
@@ -168,7 +171,10 @@ records before tonic's server drops the handler. Without the margin, the
 handler is dropped, telemetry records `UNRECORDED` and the caller sees
 `CANCELLED`. tonic reports its own timer as `CANCELLED` "Timeout expired";
 `Deadline::call` turns a `CANCELLED` that arrives at or after the stamped
-bound into `DEADLINE_EXCEEDED`. An earlier `CANCELLED` passes through.
+bound into `DEADLINE_EXCEEDED`, with its details and metadata kept. An earlier
+`CANCELLED` passes through. `call` also ends the call at its bound itself,
+because tonic's timer does not run while a request waits for a ready endpoint,
+a connect or a TLS handshake.
 
 **The edges.** With no incoming deadline the inner request is stamped with the
 ceiling, with no margin, so the next hop is still told. The propagated value is
@@ -182,7 +188,11 @@ deadline)`.
 A `-db` service needs no call here. tonic's server drops a handler when its
 `grpc-timeout` expires, and a pending pool acquire inside the handler is
 dropped with it. So the acquire is bounded by min(`acquireTimeoutSeconds`,
-remaining) once the caller sends the header.
+remaining) once the caller sends the header. A dropped handler is not a clean
+cancel of the database work: a query already sent keeps running on the server,
+and a drop between two statements (`SET TRANSACTION` and `BEGIN`, or during
+`BEGIN`) can return a connection to the pool with state the next borrower
+inherits.
 
 ## What it tells an operator
 
