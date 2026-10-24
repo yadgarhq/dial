@@ -178,9 +178,9 @@
 //! # This file
 //!
 //! LEDGER 719 split what used to be one 1987-line `lib.rs` along the seams
-//! already in it: [`tls`] (options and their preparation), [`connect`] (the
-//! entry points and the boot dial), [`resolve`] (the re-resolution loop), and
-//! [`error`] (the one error type all of them return). This file keeps the
+//! already in it: `tls` (options and their preparation), `connect` (the
+//! entry points and the boot dial), `resolve` (the re-resolution loop), and
+//! `error` (the one error type all of them return). This file keeps the
 //! crate's shared vocabulary — the metric, the timeouts, and [`diff`], which
 //! every other module reads but none of them owns.
 
@@ -301,7 +301,15 @@ const RERESOLVE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): s
 /// A dead pod must not hold a request open until the caller's deadline. Named
 /// rather than written twice because it bounds TWO phases once TLS is on — see
 /// `endpoint`, where the reason it has to be stated twice is recorded.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2); // ADR-0569-EXCEPTION(CC): shared with the TLS handshake bound in TlsOptions::prepare — one value, not two.
+///
+/// It bounds the TCP connect plus the TLS handshake. Each phase gets this
+/// bound on its own, so a TLS dial can take up to twice this value before it
+/// fails. It does NOT bound a request: that is [`default_request_timeout`].
+///
+/// Public so a caller that must order its own deadlines against the dial (a
+/// server that calls a `dial` channel under its own timeout) can import the
+/// value instead of restating it.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2); // ADR-0569-EXCEPTION(CC): shared with the TLS handshake bound in TlsOptions::prepare — one value, not two.
 
 /// How often an established connection sends an HTTP/2 PING to notice a peer
 /// that vanished without closing it — the common case when a node goes away.
