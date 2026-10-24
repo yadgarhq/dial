@@ -28,7 +28,7 @@ use crate::CONNECT_TIMEOUT;
 ///
 /// **Mutual TLS is a configuration addition, not a redesign**, and
 /// [`TlsOptions::identity`] is it: two more paths, no change to
-/// [`connect_tls`]'s signature. It is OFF unless set, so every caller that
+/// [`crate::connect_tls`]'s signature. It is OFF unless set, so every caller that
 /// says nothing about it dials exactly as it did before.
 #[derive(Clone, Debug)]
 pub struct TlsOptions {
@@ -52,7 +52,7 @@ impl TlsOptions {
     /// Verify the peer against the certificate authorities in the PEM bundle at
     /// `ca_certificate`.
     ///
-    /// The file is read and checked when [`connect_tls`] runs, not here.
+    /// The file is read and checked when [`crate::connect_tls`] runs, not here.
     pub fn new(ca_certificate: impl Into<PathBuf>) -> Self {
         Self {
             ca_certificate: ca_certificate.into(),
@@ -62,7 +62,7 @@ impl TlsOptions {
     }
 
     /// Verify the peer's certificate against `domain_name` instead of against
-    /// the host passed to [`connect_tls`].
+    /// the host passed to [`crate::connect_tls`].
     pub fn domain_name(self, domain_name: impl Into<String>) -> Self {
         Self {
             domain_name: Some(domain_name.into()),
@@ -90,7 +90,7 @@ impl TlsOptions {
     /// pins that as an accepted gap rather than a guarantee.
     ///
     /// **Paths, never an issuer-specific resource** (D80), for the reason given
-    /// on [`TlsOptions`]. Both files are read when [`connect_tls`] runs.
+    /// on [`TlsOptions`]. Both files are read when [`crate::connect_tls`] runs.
     ///
     /// NOTHING VERIFIES WHAT THE CERTIFICATE SAYS THE CALLER IS. A peer that
     /// checks a client certificate learns that this deployment issued it, not

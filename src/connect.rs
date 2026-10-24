@@ -180,7 +180,7 @@ pub(crate) fn endpoint(
 /// still fails here is a host that cannot form a URI authority, which no
 /// resolution would fix.
 ///
-/// Requests are bounded by [`default_request_timeout`]. A caller that needs its
+/// Requests are bounded by [`crate::default_request_timeout`]. A caller that needs its
 /// own bound uses [`connect_with_request_timeout`].
 pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
     connect_with(host, port, None, REQUEST_TIMEOUT).await
