@@ -175,6 +175,14 @@
 //! above keepalive detection) ..= [`max_request_timeout`] (one second below
 //! the 60s ingress idle timeout).
 //!
+//! **A caller's deadline is carried inward, not only enforced** (ADR-1019).
+//! The request timeout above is a CEILING per hop. A hop serving gRPC captures
+//! its caller's `grpc-timeout` with [`Deadline::of`] at handler entry and
+//! stamps every inner request with [`Deadline::apply`] (or runs it through
+//! [`Deadline::call`]), so the hop behind it is bounded by min(ceiling, the
+//! caller's remaining time less [`DEADLINE_MARGIN`]) and its work is dropped
+//! before the caller gives up. See [`Deadline`].
+//!
 //! # This file
 //!
 //! LEDGER 719 split what used to be one 1987-line `lib.rs` along the seams
@@ -194,6 +202,7 @@ use std::time::Duration;
 use tonic::transport::channel::Change;
 
 mod connect;
+mod deadline;
 mod error;
 mod request_timeout;
 mod resolve;
@@ -202,6 +211,7 @@ mod tls;
 pub use connect::{
     connect, connect_tls, connect_tls_with_request_timeout, connect_with_request_timeout,
 };
+pub use deadline::{Deadline, DEADLINE_MARGIN, GRPC_TIMEOUT};
 pub use error::BalanceError;
 pub use request_timeout::{
     max_request_timeout, min_request_timeout, request_timeout_from_lookup, RequestTimeoutError,
