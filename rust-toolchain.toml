@@ -1,9 +1,9 @@
 [toolchain]
-# Aligned with the rust-build base image (rust:1.98-bookworm, D63). A repo that
+# Aligned with the rust-build base image (rust:1.99-bookworm, D63, ADR-1118). A repo that
 # pins an OLDER channel makes rustup fetch a second toolchain inside the image
 # and recompile everything with it — which throws away the cargo-chef dependency
 # layer the base exists to provide, silently and slowly.
-channel = "1.98.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 
 # DECLARED, not assumed. The base runs `rustup target add
