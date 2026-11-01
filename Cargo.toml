@@ -2,7 +2,7 @@
 name = "yadgar-dial"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.99.1"
 license = "Apache-2.0"
 description = "How a service reaches another service: client-side gRPC balancing over a headless Service (D23)."
 
