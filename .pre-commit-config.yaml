@@ -9,7 +9,9 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
       - id: check-merge-conflict
+        args: [--assume-in-merge]
       - id: check-added-large-files
+        args: [--enforce-all]
       - id: check-yaml
         # Helm templates are Go templates that HAPPEN to look like YAML —
         # `{{- toYaml ... }}` is a syntax error to any real parser. Excluding
