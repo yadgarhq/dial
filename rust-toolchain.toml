@@ -3,7 +3,7 @@
 # pins an OLDER channel makes rustup fetch a second toolchain inside the image
 # and recompile everything with it — which throws away the cargo-chef dependency
 # layer the base exists to provide, silently and slowly.
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 
 # DECLARED, not assumed. The base runs `rustup target add
